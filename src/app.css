@@ -1,0 +1,53 @@
+/* ========== 极速看片 全局样式 ========== */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  /* 与默认主题（黑）一致，避免 webview 初始化闪烁 */
+  background: #000;
+  overflow: hidden;
+}
+
+#app {
+  width: 100%;
+  height: 100%;
+}
+
+body {
+  font-family: 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', 'Noto Sans SC', sans-serif;
+  color: #fff; /* 黑色主题：全局白字 */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* 时间 / 百分比 / 序号统一等宽数字，跳动不抖动 */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 底部瞬时提示（状态 / 引导信息）：避开 104px 高的控制栏 */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 130px;
+  transform: translateX(-50%);
+  max-width: 70vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: rgba(0, 0, 0, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: #fff;
+  font-size: 13px;
+  padding: 8px 14px;
+  border-radius: 6px;
+  pointer-events: none;
+  z-index: 80;
+}

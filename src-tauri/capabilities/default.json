@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "极速看片主窗口默认权限：窗口标题 / 关闭 / 全屏 / 拖拽事件 / 目录选择对话框",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:webview:default",
+    "core:window:allow-set-title",
+    "core:window:allow-destroy",
+    "core:window:allow-close",
+    "core:window:allow-set-fullscreen",
+    "dialog:allow-open"
+  ]
+}

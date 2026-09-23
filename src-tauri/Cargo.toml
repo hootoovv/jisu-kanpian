@@ -1,0 +1,29 @@
+[package]
+name = "jisu-kanpian"
+version = "1.0.2"
+description = "极速看片 - 极速视频播放器（Tauri 2 + Svelte，多音轨 / 字幕 / HLS）"
+authors = ["jisu-kanpian"]
+edition = "2021"
+
+[lib]
+name = "jisu_kanpian_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+# 系统目录选择对话框（首页「+」按钮使用）
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+# 视频解析不在 Rust 侧做：moov 元数据 / 多音轨 / MSE 分段全部由
+# 前端 mp4box.js 完成（read_range 只负责按区间吐字节），
+# 因此相比听书项目少了 symphonia 一类的媒体解码依赖。
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
