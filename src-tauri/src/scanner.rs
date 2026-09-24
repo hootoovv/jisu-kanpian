@@ -79,6 +79,10 @@ pub struct DirectoryInfo {
 pub struct ScanResult {
     /// 规范化后的主目录
     pub root: String,
+    /// 入参是单个文件时记录其原始路径（前端据此直接定位播放该文件，
+    /// 列表仍按其所在目录构建以保留连播 / 上一个下一个；文件扩展名
+    /// 不受支持或路径形态对不上时前端找不到即回退到列表首项）
+    pub entry_file: Option<String>,
     /// 有序目录列表（只含至少有一个视频文件的目录）
     pub directories: Vec<DirectoryInfo>,
     /// 视频文件总数
@@ -188,20 +192,21 @@ fn scan_dir(abs: &Path, rel: &str, out: &mut Vec<DirectoryInfo>, depth: usize) {
 }
 
 /// 对外入口：扫描一个根目录。
-/// 若传入的是文件路径，则自动改用其所在目录（对拖拽文件更友好）。
+/// 若传入的是文件路径，则扫描其所在目录（保留连播上下文）并把
+/// 原始文件路径放进 entry_file（前端定位到该文件直接播放）。
 pub fn scan(root: &str) -> Result<ScanResult, String> {
     let p = PathBuf::from(root);
-    let dir = if p.is_dir() {
-        p
+    let (dir, entry_file) = if p.is_dir() {
+        (p, None)
     } else if p.is_file() {
         let parent = p
             .parent()
             .ok_or_else(|| "无法获取父目录".to_string())?
             .to_path_buf();
         if parent.as_os_str().is_empty() {
-            PathBuf::from(".")
+            (PathBuf::from("."), Some(root.to_string()))
         } else {
-            parent
+            (parent, Some(root.to_string()))
         }
     } else {
         return Err(format!("路径不存在：{root}"));
@@ -213,6 +218,7 @@ pub fn scan(root: &str) -> Result<ScanResult, String> {
 
     Ok(ScanResult {
         root: path_to_string(&dir),
+        entry_file,
         directories,
         total_files,
     })
@@ -313,9 +319,17 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         fs::write(base.join("x.mp4"), b"x").unwrap();
-        let res = scan(base.join("x.mp4").to_str().unwrap()).unwrap();
+        let file = base.join("x.mp4");
+        let res = scan(file.to_str().unwrap()).unwrap();
         assert_eq!(res.total_files, 1);
         assert!(res.root.ends_with(base.file_name().unwrap().to_string_lossy().as_ref()));
+        // 单文件入口：entry_file 记录原始路径，且与扫描出的文件路径一致
+        //（前端据此定位直接播放该文件）
+        assert_eq!(res.entry_file.as_deref(), Some(file.to_str().unwrap()));
+        assert_eq!(res.directories[0].files[0].path, file.to_str().unwrap());
+        // 目录入口：entry_file 为 None
+        let res = scan(base.to_str().unwrap()).unwrap();
+        assert_eq!(res.entry_file, None);
         let _ = fs::remove_dir_all(&base);
     }
 

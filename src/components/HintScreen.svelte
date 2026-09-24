@@ -1,19 +1,25 @@
 <script>
   /**
    * 初始 / 扫描中 / 空目录 / 出错 时的引导屏。
-   * hint / empty / error 状态都提供一个大号「+」按钮，
-   * 点击后弹出系统目录选择对话框（与拖拽目录等效）。
-   * 视觉沿用极速听书的引导页：黑底、亮黄点缀、居中构图；
-   * 图形换成胶片 + 播放三角（看片的视觉符号，对应听书的声波柱）。
+   * hint / empty / error 状态都提供一个大号「+」按钮（选文件夹），
+   * 与一个次级「打开单个文件」入口（直接播放该文件，不默认显示
+   * 文件列表）。视觉沿用极速听书的引导页：黑底、亮黄点缀、居中
+   * 构图；图形换成胶片 + 播放三角（看片的视觉符号）。
    */
-  let { phase = 'hint', message = '', dragActive = false, onpick = null } = $props();
+  let { phase = 'hint', message = '', dragActive = false, onpick = null, onpickfile = null } = $props();
 
   /** 按钮是否可用（有回调且不在扫描中） */
   const canPick = $derived(typeof onpick === 'function' && phase !== 'scanning');
+  const canPickFile = $derived(typeof onpickfile === 'function' && phase !== 'scanning');
 
   function handleClick(e) {
     e.stopPropagation();
     if (canPick) onpick();
+  }
+
+  function handleFileClick(e) {
+    e.stopPropagation();
+    if (canPickFile) onpickfile();
   }
 </script>
 
@@ -61,10 +67,21 @@
       <span class="pick-label">选择视频文件夹</span>
     </button>
 
+    <!-- 次级入口：选单个视频文件直接播放（不默认显示文件列表） -->
+    <button
+      type="button"
+      class="file-btn"
+      class:disabled={!canPickFile}
+      onclick={handleFileClick}
+      disabled={!canPickFile}
+      aria-label="打开单个视频文件"
+      title="直接播放选中的文件（列表按其所在目录构建，可随时按 T 打开）"
+    >打开单个视频文件</button>
+
     {#if phase === 'hint'}
-      <div class="sub alt">也可以直接把「文件夹」拖拽到窗口任意位置</div>
+      <div class="sub alt">也可以把「文件夹」或「视频文件」直接拖拽到窗口任意位置</div>
     {:else}
-      <div class="sub alt">选择其他文件夹，或重新拖拽一个文件夹</div>
+      <div class="sub alt">选择其他文件夹 / 单个文件，或重新拖拽</div>
     {/if}
   {/if}
 </div>
@@ -213,6 +230,36 @@
     letter-spacing: 1px;
     color: rgba(255, 255, 255, 0.75);
     transform: translateY(-4px);
+  }
+
+  /* ---- 次级入口：打开单个视频文件（低调的文字按钮） ---- */
+  .file-btn {
+    margin-top: 2px;
+    padding: 7px 18px;
+    border-radius: 16px;
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    background: transparent;
+    color: rgba(255, 255, 255, 0.65);
+    font-size: 13px;
+    font-family: inherit;
+    letter-spacing: 0.5px;
+    cursor: pointer;
+    transition:
+      border-color 0.12s ease,
+      color 0.12s ease,
+      background 0.12s ease;
+  }
+  .file-btn:hover {
+    border-color: rgba(255, 214, 10, 0.6);
+    color: #ffd60a;
+    background: rgba(255, 214, 10, 0.06);
+  }
+  .file-btn:active {
+    background: rgba(255, 214, 10, 0.14);
+  }
+  .file-btn.disabled {
+    opacity: 0.35;
+    pointer-events: none;
   }
 
   .spinner {

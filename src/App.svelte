@@ -94,6 +94,7 @@
   let infoVisible = $state(true);     // I 键：顶部信息栏（默认显示）
   let ctrlVisible = $state(true);     // C 键：底部控制栏（默认显示）
   let listVisible = $state(true);     // T 键：右侧文件列表浮层（默认显示）
+  let listSuppressed = $state(false); // 单文件入口的会话级收起（不改持久偏好；T 可再打开）
   let helpVisible = $state(false);    // F1：帮助层
   let status = $state('');
 
@@ -156,7 +157,7 @@
      偏好（持久化照常），退出后生效。非全屏时始终跟随偏好。 */
   const infoShown = $derived(!fullscreen && infoVisible);
   const ctrlShown = $derived(!fullscreen && ctrlVisible);
-  const listShown = $derived(!fullscreen && listVisible);
+  const listShown = $derived(!fullscreen && listVisible && !listSuppressed);
   const pageSize = $derived(Math.max(1, Math.floor(listH / LIST_ROW_H)));
   const pageCount = $derived(Math.max(1, Math.ceil(lines.length / pageSize)));
   const pageLines = $derived.by(() => {
@@ -1047,6 +1048,22 @@
     }
   }
 
+  /** 首页「打开单个文件」：选一个视频文件直接播放（列表仍按其所在
+   *  目录构建，保留连播 / 上下文件切换；本次会话不默认显示列表） */
+  async function pickFile() {
+    if (phase === 'scanning') return;
+    try {
+      const f = await openDialog({
+        title: '选择视频文件',
+        directory: false,
+        multiple: false
+      });
+      if (typeof f === 'string' && f) openRoot(f);
+    } catch (e) {
+      setStatus(`打开文件选择对话框失败：${e}`);
+    }
+  }
+
   /** 摊平扫描结果：flat（播放序列）+ lines（分页行，含目录分组头）+ 字幕索引 */
   function buildList(scan) {
     root = scan.root;
@@ -1067,12 +1084,17 @@
   }
 
   /**
-   * 打开一个根目录（拖拽进来的是文件时自动改用其父目录）。
+   * 打开一个根目录或单个视频文件。
+   * - 目录：按扫描顺序从首个文件播起（或按 restore 断点续看）；
+   * - 文件（拖拽 / 文件选择框）：扫描其所在目录构建连播列表，但直接
+   *   定位到该文件立即播放，且本次会话默认不显示文件列表浮层
+   *   （scan.entryFile 由后端 scan 返回；T 键可随时打开列表）。
    * restore：上次会话的状态，用于断点续看——定位到退出的位置并暂停。
    */
   async function openRoot(rootPath, restore = null) {
     phase = 'scanning';
     phaseMessage = '正在扫描目录并排序…';
+    listSuppressed = false; // 每次入口重置（仅单文件入口重新置位）
     try {
       videoEl.pause();
     } catch {
@@ -1104,6 +1126,13 @@
           start = idx;
           seekSec = (restore.position_ms || 0) / 1000;
           autoplay = false; // 断点续看：定位到退出位置，暂停等待
+        }
+      } else if (scan.entryFile) {
+        // 单文件入口：定位到该文件直接播放（该文件自身的断点记忆仍生效）
+        const idx = flat.findIndex((f) => f.path === scan.entryFile);
+        if (idx >= 0) {
+          start = idx;
+          listSuppressed = true; // 会话级收起列表（不写入持久偏好）
         }
       }
       playIndex(start, { autoplay, seekSec });
@@ -1139,6 +1168,7 @@
     lines = [];
     cursorIdx = 0;
     currentPage = 0;
+    listSuppressed = false; // 会话级列表收起随关闭清除
     view = { rel: '', dir: '', name: '', pos: 0, total: 0 };
     curTime = 0;
     duration = 0;
@@ -1320,7 +1350,13 @@
       case 'T':
         e.preventDefault();
         if (phase === 'view') {
-          listVisible = !listVisible;
+          if (listSuppressed) {
+            // 单文件入口收起后首次按 T：直接打开列表（清除会话级收起）
+            listSuppressed = false;
+            listVisible = true;
+          } else {
+            listVisible = !listVisible;
+          }
           scheduleSave();
         }
         break;
@@ -1586,7 +1622,7 @@
 {/if}
 
 {#if phase !== 'view'}
-  <HintScreen {phase} message={phaseMessage} {dragActive} onpick={pickDirectory} />
+  <HintScreen {phase} message={phaseMessage} {dragActive} onpick={pickDirectory} onpickfile={pickFile} />
 {/if}
 
 {#if phase === 'view' && infoShown}
