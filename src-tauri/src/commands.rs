@@ -5,8 +5,11 @@
 //! | scan_directory          | 递归扫描目录（自然排序），返回有序结构           |
 //! | read_range              | 按区间读取文件字节（mp4box.js 分析 moov 用）     |
 //! | stat_file               | 读取文件总大小（moov 尾部定位用）                |
-//! | extract_mkv_subtitles   | MKV 内嵌字幕提取（ffmpeg → 原生 EBML 双引擎）    |
-//! | query_extract_progress  | 提取进度轮询（前端 await 期间展示百分比）         |
+//! | subtitle_session_open   | MKV 字幕索引会话（引擎 ①：解析 Cues 位置表）     |
+//! | subtitle_window         | 按播放窗口直跳取字幕块（引擎 ①，毫秒级）         |
+//! | subtitle_close          | 关闭字幕会话（切轨 / 切文件时调用，幂等）        |
+//! | extract_mkv_subtitles   | MKV 内嵌字幕全量提取（引擎 ②：原生 EBML 走读）   |
+//! | query_extract_progress  | 全量提取进度轮询（前端 await 期间展示百分比）    |
 //! | load_state              | 读取上次的观看位置与播放偏好                     |
 //! | save_state              | 保存当前观看位置与各项偏好                       |
 //! | set_keep_awake          | 播放期间阻止屏保 / 休眠（Wake Lock 不可用时兜底）|
@@ -65,9 +68,45 @@ pub fn read_range(path: String, offset: u64, length: u64) -> Result<tauri::ipc::
     Ok(tauri::ipc::Response::new(buf))
 }
 
-/// 提取 MKV 内嵌字幕轨（v1.0.5 三级引擎的前两级：ffmpeg 优先、
-/// 原生 EBML 兜底；均失败时前端回退 JS 流式兼容路径）。
-/// 解析在阻塞线程池执行；进度经 query_extract_progress 轮询。
+/// 打开 MKV 字幕索引会话（引擎 ①：解析 SeekHead + Cues，目标轨位置表
+/// 常驻内存，亚秒级）。无可用索引时返回 Err（前端降级全量提取）。
+/// 解析在阻塞线程池执行。
+#[tauri::command]
+pub async fn subtitle_session_open(
+    path: String,
+    track_number: u64,
+) -> Result<crate::mkvsub::SessionInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::mkvsub::session_open(&path, track_number))
+        .await
+        .map_err(|e| format!("会话任务执行失败：{e}"))?
+}
+
+/// 取一个播放窗口的字幕块（引擎 ①：按索引直跳，只碰窗口内字节的
+/// 几十 KB；毫秒级）。skipped > 0 表示有索引条目未命中，前端应降级
+/// 全量提取保证完整性。
+#[tauri::command]
+pub async fn subtitle_window(
+    session_id: u64,
+    from_ms: u64,
+    to_ms: u64,
+) -> Result<crate::mkvsub::WindowResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::mkvsub::session_window(session_id, from_ms, to_ms)
+    })
+    .await
+    .map_err(|e| format!("窗口任务执行失败：{e}"))?
+}
+
+/// 关闭字幕索引会话（切轨 / 切文件时调用；幂等）
+#[tauri::command]
+pub fn subtitle_close(session_id: u64) {
+    crate::mkvsub::session_close(session_id);
+}
+
+/// 提取 MKV 内嵌字幕轨（引擎 ②：一次性全量走读；无索引文件的兜底
+/// 路径，进度经 query_extract_progress 轮询）。均失败时前端回退
+/// JS 流式兼容路径（引擎 ③）。
+/// 解析在阻塞线程池执行。
 #[tauri::command]
 pub async fn extract_mkv_subtitles(
     path: String,

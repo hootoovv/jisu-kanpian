@@ -173,6 +173,21 @@ export class SubtitleManager {
     }
   }
 
+  /**
+   * 向当前字幕轨追加 cue（索引会话的后续窗口：track 已挂载，新窗口
+   * 的块直接 addCue，不必重建 <track>）。cue 结构同 cuesToVtt 输入。
+   */
+  appendCues(cues) {
+    const track = this.trackEl && this.trackEl.track;
+    if (!track) return;
+    for (const c of cues || []) {
+      if (!c || !c.text || !String(c.text).trim() || !(c.end > c.start)) continue;
+      try {
+        track.addCue(new VTTCue(c.start, c.end, String(c.text).trim()));
+      } catch { /* 单条失败跳过（文本含不支持的节点等） */ }
+    }
+  }
+
   /** 卸载当前字幕 */
   detach() {
     if (this.trackEl) {

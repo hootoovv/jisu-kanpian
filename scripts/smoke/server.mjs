@@ -8,6 +8,7 @@
  * - GET /files/<enc> → convertFileSrc 映射出的本地文件（视频 / 字幕 / HLS）
  * - POST /__invoke   → {cmd, args} 路由到 JS 版后端：
  *     scan_directory / read_range / stat_file / load_state / save_state /
+ *     subtitle_session_open / subtitle_window / subtitle_close /
  *     extract_mkv_subtitles / query_extract_progress / exit_app /
  *     plugin:dialog|open / plugin:window|*
  *
@@ -130,48 +131,20 @@ let savedState = null;
 const invokeLog = [];
 
 /**
- * 模拟「后端三级引擎正在运行」的窗口（extract_mkv_subtitles 快速路径
- * 故意延迟 600ms 响应，让前端的进度轮询能真实观察到 running=true +
- * method='ffmpeg'，而非一问就结束）。
+ * multi.mkv 的 SRT 轨（TrackNumber=5）索引会话块：模拟 v1.0.7 引擎 ①
+ * （Cues 索引会话）的窗口返回体。内容与 make_testmedia.sh 的
+ * sub-zh.srt 一致。真实实现见 src-tauri/src/mkvsub.rs。
  */
-let extractState = null;
-
-/**
- * multi.mkv 的 SRT 轨（TrackNumber=5）快速路径返回体：模拟后端
- * ffmpeg 引擎的输出（完整 SRT 文档；内容与 make_testmedia.sh 的
- * sub-zh.srt 一致）。真实实现见 src-tauri/src/mkvsub.rs。
- */
-const MOCK_FAST_SRT = {
-  method: 'ffmpeg',
-  kind: 'utf8',
-  text: [
-    '1',
-    '00:00:00,500 --> 00:00:03,000',
-    '欢迎观看极速看片',
-    '',
-    '2',
-    '00:00:03,500 --> 00:00:07,000',
-    '这是第一条内嵌字幕（中文）',
-    '',
-    '3',
-    '00:00:07,500 --> 00:00:11,000',
-    '多音轨与字幕切换测试',
-    '',
-    '4',
-    '00:00:11,500 --> 00:00:15,000',
-    '画面旋转与缩放测试',
-    '',
-    '5',
-    '00:00:15,500 --> 00:00:19,000',
-    '断点记忆测试',
-    '',
-    '6',
-    '00:00:19,500 --> 00:00:23,000',
-    '再见'
-  ].join('\n'),
-  header: null,
-  blocks: null
-};
+const MOCK_SRT_BLOCKS = [
+  { time: 500, duration: 2500, text: '欢迎观看极速看片' },
+  { time: 3500, duration: 3500, text: '这是第一条内嵌字幕（中文）' },
+  { time: 7500, duration: 3500, text: '多音轨与字幕切换测试' },
+  { time: 11500, duration: 3500, text: '画面旋转与缩放测试' },
+  { time: 15500, duration: 3500, text: '断点记忆测试' },
+  { time: 19500, duration: 3500, text: '再见' }
+];
+/** 模拟会话 id（subtitle_session_open 成功后发给前端） */
+const MOCK_SESSION_ID = 9001;
 
 function handleInvoke(cmd, args) {
   invokeLog.push({ cmd, t: Date.now() });
@@ -215,27 +188,33 @@ function handleInvoke(cmd, args) {
       savedState = args.state;
       fs.writeFileSync(STATE_LOG, JSON.stringify(args.state, null, 2));
       return { json: null };
-    case 'extract_mkv_subtitles': {
-      // 模拟后端三级引擎的 ①② 级（真实实现见 src-tauri/src/mkvsub.rs）：
-      // - multi.mkv 的 SRT 轨（TrackNumber=5）→ ffmpeg 快速路径（完整 SRT 文档，
-      //   延迟 600ms 响应让轮询可观察）；
-      // - 其余轨道（含 ASS 轨）→ 双引擎失败，驱动前端回退 ③ JS 流式兜底
+    case 'subtitle_session_open': {
+      // 模拟 v1.0.7 引擎 ①（Cues 索引会话）：multi.mkv 的 SRT 轨
+      // （TrackNumber=5）可开；其余轨道无索引 → 前端降级 ②③
       const p = String(args.path || '');
       const tn = Number(args.trackNumber);
       if (p.endsWith('multi.mkv') && tn === 5) {
-        extractState = { running: true, method: 'ffmpeg', expireAt: Date.now() + 900 };
-        return { json: MOCK_FAST_SRT, delayMs: 600 };
+        return { json: { sessionId: MOCK_SESSION_ID, kind: 'utf8', header: null, totalBlocks: MOCK_SRT_BLOCKS.length } };
       }
-      extractState = null;
-      throw new Error('模拟后端双引擎失败（前端应回退 JS 流式兜底）');
+      throw new Error('模拟：该文件没有可用的 Cues 索引');
     }
-    case 'query_extract_progress': {
-      const st =
-        extractState && Date.now() < extractState.expireAt
-          ? { running: true, method: extractState.method, bytes: 0, total: 1_590_000 }
-          : { running: false, method: 'none', bytes: 0, total: 0 };
-      return { json: st };
+    case 'subtitle_window': {
+      if (Number(args.sessionId) === MOCK_SESSION_ID) {
+        const from = Number(args.fromMs) || 0;
+        const to = Number(args.toMs) || 0;
+        const blocks = MOCK_SRT_BLOCKS.filter((b) => b.time >= from && b.time < to);
+        return { json: { blocks, skipped: 0 } };
+      }
+      throw new Error('字幕会话已失效');
     }
+    case 'subtitle_close':
+      return { json: null };
+    case 'extract_mkv_subtitles':
+      // 引擎 ②（全量兜底）在冒烟里一律失败：SRT 轨应已被 ① 会话接住
+      // （零 read_range 分块读可证），ASS 轨则驱动 ③ JS 流式兜底
+      throw new Error('模拟全量引擎失败（会话引擎应已处理 / 或回退 JS 流式）');
+    case 'query_extract_progress':
+      return { json: { running: false, bytes: 0, total: 0 } };
     case 'set_keep_awake':
       // 防屏保 / 休眠后备命令（真机见 src-tauri/src/power.rs）
       console.log('[mock] set_keep_awake:', args.active);

@@ -1,31 +1,30 @@
 /**
- * 极速看片 —— Matroska 内嵌字幕提取（三级引擎调度）
+ * 极速看片 —— Matroska 内嵌字幕提取（索引会话 + 全量兜底）
  *
- * v1.0.5 起提取按三级降级，解决 5GB 级大文件「分钟级」耗时问题：
- * ① ffmpeg：Rust 后端解析出 ffmpeg 时用（跨平台探测，v1.0.6：
- *    Windows 找应用同目录与 PATH 下的 ffmpeg.exe，Unix 找 PATH 里的
- *    ffmpeg；逐候选 -version 验证，坏的应用执行别名自动跳过）——
- *    `ffmpeg -i <file> -map 0:s:<n> -c:s copy -f srt/ass/webvtt pipe:1`
- *    纯 demux + copy 直写 stdout，5GB 文件秒级完成，输出即完整字幕
- *    文档（本模块只做文档 → cue 的轻量转换）；
- * ② 原生 EBML：机器无 ffmpeg（或 ffmpeg 失败）时，后端手写流式
- *    EBML 游走顺序扫 Cluster，只把目标轨字幕块读进内存——解析在
- *    原生代码完成，速度只受磁盘顺序读限制（比「IPC 传全文件字节 +
- *    JS 单线程解析」快 1~2 个数量级）；
- * ③ JS 流式兜底（v1.0.4 路径）：后端两引擎都失败时的最终安全网
- *    ——matroska-subtitles 喂 filestream.js 分块，对罕见的 lacing
- *    分帧 / 容器损伤等后端不兼容形态仍可完成提取。
- * ①② 都在后端 extract_mkv_subtitles 命令里（src-tauri/src/mkvsub.rs），
- * 前端只感知「快路径成功」与「需要回退」两种结果。
+ * v1.0.7 三级降级（删除 ffmpeg 引擎——实测被索引跳跃全面超越：
+ * 9.9GB 蓝光重封装在 5400rpm HDD 上 ffmpeg 全量 demux ~183s，索引
+ * 跳跃首窗亚秒、全片冷 ~44s / 热 ~0.5s）：
+ * ① 索引会话（Cues 跳跃）：subtitle_session_open 解析容器 Cues
+ *    索引（几百 KB、亚秒级），目标轨位置表常驻后端内存；之后按
+ *    播放窗口 subtitle_window 直跳取块——只碰窗口内字幕块的几十
+ *    KB 字节，不顺序扫全文件。首屏字幕亚秒级可用，播放中每 ~90s
+ *    补一窗，seek 即查即得（本模块的 MkvSessionSubtitlePlayer）。
+ * ② 原生全量走读：无 Cues 索引（罕见封装，如 mkvmerge --no-cues）
+ *    或会话路径失败时，后端一次性全文件顺序扫（extract_mkv_subtitles
+ *    命令，进度按文件偏移报百分比）——本模块的 extractMkvSubtitles。
+ * ③ JS 流式兜底（v1.0.4 路径）：② 也失败（罕见的 lacing 分帧 /
+ *    容器损伤）时的最终安全网——matroska-subtitles 喂 filestream.js
+ *    分块，内存恒定。
  *
  * 降级判据：后端报「定性错误」（轨道不存在 / 不是字幕轨 / 格式未
- * 适配 / 无内容 / 空文件）时直接抛出——这些错误 JS 路径同样会撞，
- * 再扫一遍 5GB 只会白等；容器级错误（读取失败 / lacing / 形状异常）
- * 与命令缺失（旧后端 / mock）才值得花时间走 ③。
+ * 适配 / 无内容 / 空文件）时直接抛出——这些错误低级路径同样会撞，
+ * 再扫一遍 5GB 只会白等；「没有可用的 Cues 索引」与容器级错误
+ * （读取失败 / lacing / 形状异常）才值得降级；命令缺失（旧后端 /
+ * mock）→ 会话路径返回 null，调用方直接走 ②③。
  *
- * 进度：后端把进度原子量暴露给 query_extract_progress（native 按文件
- * 偏移出百分比；ffmpeg 拿不到内部进度，展示引擎名），本模块在
- * invoke 挂起期间轮询并转发；③ 路径沿用自己的分块进度。
+ * 进度：仅 ② 需要等待（分钟级）——后端把进度原子量暴露给
+ * query_extract_progress（按文件偏移出百分比），本模块在 invoke
+ * 挂起期间轮询并转发；① 每窗毫秒级无需进度；③ 沿用自己的分块进度。
  */
 import { invoke } from '@tauri-apps/api/core';
 import { loadMatroskaSubtitles } from './loader.js';
@@ -42,8 +41,18 @@ const FINISH_TIMEOUT_MS = 15_000;
 /** 后端进度轮询间隔（invoke 挂起期间；首个 tick 立即触发） */
 const PROGRESS_POLL_MS = 300;
 
+/* ---------------- 索引会话（① Cues 跳跃的窗口参数） ---------------- */
+
+/** 单窗时长：一次直跳预取的对白时间跨度 */
+const WINDOW_SPAN_MS = 90_000;
+/** 起窗后向边距：覆盖「seek 落在长字幕事件中间」的场景（实测蓝光
+ *  重封装存在 10s~25s 的事件，30s 起步保守够用） */
+const WINDOW_BACK_MS = 30_000;
+/** 播放头距已覆盖末端不足该值时预取下一窗 */
+const WINDOW_AHEAD_MS = 30_000;
+
 /**
- * 定性错误：JS 兜底路径必然撞同样的墙，直接抛给用户（不白扫全文件）。
+ * 定性错误：低级路径必然撞同样的墙，直接抛给用户（不白扫全文件）。
  * 与 src-tauri/src/mkvsub.rs 的错误文案保持同步。
  */
 const DEFINITE_FAIL = [
@@ -60,7 +69,7 @@ function isDefinitiveFail(message) {
   return DEFINITE_FAIL.some((p) => String(message || '').includes(p));
 }
 
-/* ---------------- 时间戳 / 字幕文档解析（① 引擎输出转换） ---------------- */
+/* ---------------- 时间戳 / 字幕文档解析（②③ 输出转换） ---------------- */
 
 /** "HH:MM:SS,mmm" / "MM:SS.mmm"（VTT 允许省略时）→ 秒；解析失败 NaN */
 function parseStamp(token) {
@@ -71,50 +80,6 @@ function parseStamp(token) {
   if (!m) return NaN;
   return Number(m[1] || 0) * 3600 + Number(m[2]) * 60 + Number(m[3]);
 }
-
-/**
- * 完整 SRT 文档 → cue 列表（ffmpeg 引擎 kind=utf8 的输出即 SRT 全文）。
- * 块间空行分隔；块内 = [索引行]、时间轴行 "… --> …"、正文行…。
- */
-function srtDocToCues(text) {
-  return docBlocksToCues(text, { endSettings: false });
-}
-
-/**
- * 完整 WebVTT 文档 → cue 列表（ffmpeg 引擎 kind=webvtt 的输出）。
- * 与 SRT 的差异：允许 "MM:SS.mmm" 短时间戳；时间轴行尾可带
- * align/line 等排版设置（丢弃，WebVTT cue 级设置本模块不透传）。
- */
-function vttDocToCues(text) {
-  return docBlocksToCues(text, { endSettings: true });
-}
-
-function docBlocksToCues(text, { endSettings }) {
-  const cues = [];
-  const blocks = String(text || '')
-    .replace(/\r+\n/g, '\n')
-    .replace(/^\uFEFF/, '') // BOM
-    .split(/\n{2,}/);
-  for (const block of blocks) {
-    const lines = block.trim().split('\n');
-    const ti = lines.findIndex((l) => l.includes('-->'));
-    if (ti < 0) continue; // WEBVTT 头 / NOTE / STYLE / 索引行…非 cue 块
-    const [startTok, endPart] = lines[ti].split('-->');
-    const endTok = endSettings ? String(endPart || '').trim().split(/\s+/)[0] : endPart;
-    const start = parseStamp(startTok);
-    const end = parseStamp(endTok);
-    if (!isFinite(start) || !isFinite(end)) continue;
-    const body = lines
-      .slice(ti + 1)
-      .join('\n')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
-    if (body && end > start) cues.push({ start, end, text: body });
-  }
-  return cues;
-}
-
-/* ---------------- 后端 ExtractResult → cue 列表 ---------------- */
 
 /** native 引擎块（Rust SubBlock，camelCase）→ cue（utf8 / webvtt 轨） */
 function plainBlocksToCues(blocks) {
@@ -131,46 +96,210 @@ function plainBlocksToCues(blocks) {
     .filter((c) => c.end > c.start);
 }
 
+/** 窗口/全量的字幕块 → cue 列表（ASS：头 + 块重组 → ass-compiler） */
+function blocksToCues(blocks, kind, header) {
+  if (kind === 'ass') {
+    return assToCues(assDocFromBlocks(header || '', blocks));
+  }
+  return plainBlocksToCues(blocks);
+}
+
 /**
- * 后端（① ffmpeg / ② native）的 ExtractResult → cue 列表。
+ * 后端 ExtractResult（② 全量）→ cue 列表。
  * 字段对齐见 src-tauri/src/mkvsub.rs 的 ExtractResult / SubBlock。
  * 转换失败（空内容 / ASS 解析失败）抛错——由调用方决定是否降级 ③。
  */
 function backendResultToCues(res) {
   if (!res || !res.method) throw new Error('后端返回格式异常');
-  if (res.method === 'ffmpeg') {
-    // ffmpeg 输出即完整字幕文档：ass 含 CodecPrivate 头 + 全部 Dialogue
-    const text = String(res.text || '').trim();
-    if (!text) throw new Error('后端未返回字幕内容');
-    let cues;
-    if (res.kind === 'ass') {
-      cues = assToCues(text);
-    } else if (res.kind === 'webvtt') {
-      cues = vttDocToCues(text);
-    } else {
-      cues = srtDocToCues(text);
-    }
-    if (!cues.length) throw new Error('该字幕轨没有可显示的内容');
-    return cues;
-  }
-  // native：ASS 头（CodecPrivate）+ 字幕块（字段与 matroska-subtitles 对齐）
   const blocks = Array.isArray(res.blocks) ? res.blocks : [];
   if (!blocks.length) throw new Error('该字幕轨没有可显示的内容');
-  let cues;
-  if (res.kind === 'ass') {
-    cues = assToCues(assDocFromBlocks(res.header || '', blocks));
-  } else {
-    cues = plainBlocksToCues(blocks);
-  }
+  const cues = blocksToCues(blocks, res.kind, res.header || '');
   if (!cues.length) throw new Error('该字幕轨没有可显示的内容');
   return cues;
 }
 
-/* ---------------- 后端进度轮询（invoke 挂起期间） ---------------- */
+/* ---------------- ① 索引会话：打开 / 窗口取块 ---------------- */
 
 /**
- * 轮询 query_extract_progress 并转发 opt.onProgress(bytes, total, method)。
- * 返回停止函数；首个 tick 立即触发（快速任务也至少上报一次引擎名）。
+ * 打开 MKV 字幕索引会话（引擎 ①）。
+ * @returns {Promise<object|null>} 成功 → 会话对象（window/close 方法）；
+ *   无索引 / 容器级错误 / 命令缺失（旧后端 / mock）→ null（调用方走
+ *   全量降级）；定性错误（轨道 / 格式）→ throw（与 ② 同套文案）
+ */
+export async function openMkvSubtitleSession(path, trackNumber, track) {
+  const kind = track?.codec || 'utf8';
+  if (['pgs', 'vobsub', 'kate', 'unknown'].includes(kind)) {
+    throw new Error(kind === 'unknown' ? '未适配的字幕格式' : '图形字幕（PGS/VOBSub）暂不支持');
+  }
+  try {
+    const s = await invoke('subtitle_session_open', { path, trackNumber });
+    if (!s || !s.sessionId) throw new Error('会话返回格式异常');
+    const header = s.header || '';
+    return {
+      id: Number(s.sessionId),
+      kind: s.kind || kind,
+      header,
+      totalBlocks: Number(s.totalBlocks) || 0,
+      /**
+       * 取一个播放窗口的 cue 列表 [fromMs, toMs)。
+       * skipped > 0（索引条目未命中）抛错——由播放器触发全量降级，
+       * 不静默丢字幕。
+       */
+      async window(fromMs, toMs) {
+        const r = await invoke('subtitle_window', {
+          sessionId: s.sessionId,
+          fromMs: Math.max(0, Math.floor(fromMs)),
+          toMs: Math.max(0, Math.ceil(toMs))
+        });
+        if (!r || !Array.isArray(r.blocks)) throw new Error('窗口返回格式异常');
+        if (Number(r.skipped) > 0) throw new Error('索引跳跃不完整');
+        return blocksToCues(r.blocks, s.kind || kind, header);
+      },
+      close() {
+        invoke('subtitle_close', { sessionId: s.sessionId }).catch(() => { /* 关闭失败不致命 */ });
+      }
+    };
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    if (isDefinitiveFail(msg)) throw e;
+    return null; // 无索引 / 容器级问题 / 命令缺失 → 全量降级
+  }
+}
+
+/* ---------------- ① 索引会话：窗口播放器（边播边取） ---------------- */
+
+function cueKey(c) {
+  return `${c.start}\u0000${c.end}\u0000${c.text}`;
+}
+
+/**
+ * 索引会话播放器：首窗挂 <track>，播放中按需补窗（addCue 追加），
+ * seek 落到未覆盖区间即查即得；cue 以 (start,end,text) 去重。
+ * 任一窗口失败（含 skipped>0 / 会话失效）→ onFail 一次性回调，
+ * 由 App 层降级全量提取。
+ */
+export class MkvSessionSubtitlePlayer {
+  /**
+   * @param {object} session openMkvSubtitleSession 的返回
+   * @param {HTMLVideoElement} videoEl
+   * @param {import('../subtitles.js').SubtitleManager} manager
+   * @param {object} opt { lang, label, cuesToVtt, onFail }
+   */
+  constructor(session, videoEl, manager, opt = {}) {
+    this.session = session;
+    this.videoEl = videoEl;
+    this.manager = manager;
+    this.lang = opt.lang || 'zh';
+    this.label = opt.label || '字幕';
+    this.cuesToVtt = opt.cuesToVtt;
+    this.onFail = opt.onFail || null;
+    this.coverFrom = Infinity; // 已覆盖区间 [coverFrom, coverUntil)
+    this.coverUntil = -Infinity;
+    this.attached = false;
+    this.seen = new Set();
+    this.busy = false;
+    this.failed = false;
+    this.destroyed = false;
+  }
+
+  /** 挂载首窗（当前播放位置起，含后向边距；对白未开始也可为空窗） */
+  async start() {
+    const t = (this.videoEl.currentTime || 0) * 1000;
+    try {
+      const from = Math.max(0, t - WINDOW_BACK_MS);
+      const cues = await this.session.window(from, t + WINDOW_SPAN_MS);
+      if (this.destroyed) return;
+      this.coverFrom = from;
+      this.coverUntil = t + WINDOW_SPAN_MS;
+      const fresh = this.remember(cues);
+      await this.manager.attach({
+        vttText: this.cuesToVtt(fresh),
+        lang: this.lang,
+        label: this.label
+      });
+      this.attached = true;
+    } catch (e) {
+      this.fail(e);
+    }
+  }
+
+  /** timeupdate 驱动：播放头逼近已覆盖末端时预取下一窗并追加 */
+  async tick() {
+    if (this.destroyed || this.failed || !this.attached || this.busy) return;
+    const t = (this.videoEl.currentTime || 0) * 1000;
+    if (t + WINDOW_AHEAD_MS <= this.coverUntil) return;
+    this.busy = true;
+    try {
+      // 从已覆盖末端续到 min(播放头+SPAN, 末端+SPAN)：区间连续无重叠
+      const to = Math.min(t + WINDOW_SPAN_MS, this.coverUntil + WINDOW_SPAN_MS);
+      const cues = await this.session.window(this.coverUntil, to);
+      if (this.destroyed) return;
+      this.coverUntil = to;
+      const fresh = this.remember(cues);
+      if (fresh.length) this.manager.appendCues(fresh);
+    } catch (e) {
+      this.fail(e);
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /** seek 驱动：落到已覆盖区间之外（前进越过末端 / 倒退到始端前）
+   *  即查新窗追加（去重防重复挂载） */
+  async onSeek() {
+    if (this.destroyed || this.failed || !this.attached || this.busy) return;
+    const t = (this.videoEl.currentTime || 0) * 1000;
+    if (t >= this.coverFrom && t < this.coverUntil) return;
+    this.busy = true;
+    try {
+      const from = Math.max(0, t - WINDOW_BACK_MS);
+      const to = t + WINDOW_SPAN_MS;
+      const cues = await this.session.window(from, to);
+      if (this.destroyed) return;
+      this.coverFrom = Math.min(this.coverFrom, from);
+      this.coverUntil = Math.max(this.coverUntil, to);
+      const fresh = this.remember(cues);
+      if (fresh.length) this.manager.appendCues(fresh);
+    } catch (e) {
+      this.fail(e);
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  remember(cues) {
+    const fresh = [];
+    for (const c of cues || []) {
+      const k = cueKey(c);
+      if (!this.seen.has(k)) {
+        this.seen.add(k);
+        fresh.push(c);
+      }
+    }
+    return fresh;
+  }
+
+  fail(e) {
+    if (this.failed || this.destroyed) return;
+    this.failed = true;
+    try {
+      if (this.onFail) this.onFail(e);
+    } catch { /* 回调异常不再传播 */ }
+  }
+
+  destroy() {
+    this.destroyed = true;
+    try {
+      this.session.close();
+    } catch { /* 忽略 */ }
+  }
+}
+
+/* ---------------- 后端进度轮询（② invoke 挂起期间） ---------------- */
+
+/**
+ * 轮询 query_extract_progress 并转发 opt.onProgress(bytes, total)。
+ * 返回停止函数；首个 tick 立即触发（快速任务也至少上报一次）。
  */
 function pollBackendProgress(onProgress, shouldAbort) {
   let stopped = false;
@@ -180,7 +309,7 @@ function pollBackendProgress(onProgress, shouldAbort) {
     invoke('query_extract_progress')
       .then((s) => {
         if (stopped || !s || !s.running) return;
-        onProgress(Number(s.bytes) || 0, Number(s.total) || 0, s.method);
+        onProgress(Number(s.bytes) || 0, Number(s.total) || 0);
       })
       .catch(() => { /* 轮询失败不影响提取本体 */ });
   };
@@ -192,20 +321,19 @@ function pollBackendProgress(onProgress, shouldAbort) {
   };
 }
 
-/* ---------------- 对外入口：三级调度 ---------------- */
+/* ---------------- 对外入口：全量降级（② → ③） ---------------- */
 
 /**
- * 提取一条 MKV 内嵌字幕轨（三级引擎，见模块注释）。
+ * 全量提取一条 MKV 内嵌字幕轨（引擎 ②③：无索引文件的兜底路径）。
  * @param {string} path 视频文件绝对路径
  * @param {number} fileSize 文件总大小（stat_file 结果，③ 路径进度分母）
  * @param {number} trackNumber 目标轨道的 TrackNumber
  * @param {object} track 轨道描述（tracks.js 的 subtitleTracks 项）
  * @param {object} [opt]
- * @param {(bytes:number,total:number,method?:string)=>void} [opt.onProgress]
- *   进度回调；①② 路径带第三参 method（'ffmpeg'|'native'，ffmpeg 无
- *   内部进度，调用方应展示引擎名而非百分比），③ 路径两参（百分比）
+ * @param {(bytes:number,total:number)=>void} [opt.onProgress]
+ *   ② 路径进度回调（按文件偏移百分比）；③ 路径两参（百分比）
  * @param {()=>boolean} [opt.shouldAbort] 返回 true 则静默取消（resolve null；
- *   仅 ③ 路径可中断，①② 由调用方按代次丢弃结果）
+ *   仅 ③ 路径可中断，② 由调用方按代次丢弃结果）
  * @param {number} [opt.chunkBytes] ③ 路径单块大小（默认 4MB；冒烟测试
  *   用小值验证跨块边界的解析正确性）
  * @returns {Promise<{start:number,end:number,text:string}[]|null>}
@@ -217,7 +345,7 @@ export async function extractMkvSubtitles(path, fileSize, trackNumber, track, op
     throw new Error(kind === 'unknown' ? '未适配的字幕格式' : '图形字幕（PGS/VOBSub）暂不支持');
   }
 
-  /* ①② 后端双引擎（ffmpeg → 原生 EBML，见 src-tauri/src/mkvsub.rs） */
+  /* ② 后端原生全量走读（src-tauri/src/mkvsub.rs） */
   let backendErr = null;
   try {
     const stopPoll = opt.onProgress ? pollBackendProgress(opt.onProgress, opt.shouldAbort) : null;
@@ -232,7 +360,7 @@ export async function extractMkvSubtitles(path, fileSize, trackNumber, track, op
     return cues;
   } catch (e) {
     backendErr = e instanceof Error ? e.message : String(e);
-    if (isDefinitiveFail(backendErr)) throw e; // 定性失败：JS 路径必撞同墙，不白扫
+    if (isDefinitiveFail(backendErr)) throw e; // 定性失败：低级路径必撞同墙，不白扫
     // 容器级失败 / 旧后端无此命令 / 输出形状异常 → ③ 兜底
     if (typeof window !== 'undefined') window.__kpExtractFallbackReason = backendErr;
   }
@@ -297,15 +425,8 @@ async function extractViaJs(path, fileSize, trackNumber, track, opt = {}) {
         return;
       }
       try {
-        if (kind === 'ass') {
-          // ASS：重组文档 → ass-compiler → 富文本 cue
-          const cues = assToCues(assDocFromBlocks(header, blocks));
-          done(cues.length > 0, cues.length > 0 ? cues : new Error('ASS 字幕解析失败'));
-        } else {
-          // SRT / WebVTT：块文本即内容
-          const cues = plainBlocksToCues(blocks);
-          done(cues.length > 0, cues.length > 0 ? cues : new Error('该字幕轨没有可显示的内容'));
-        }
+        const cues = blocksToCues(blocks, kind, header);
+        done(cues.length > 0, cues.length > 0 ? cues : new Error('该字幕轨没有可显示的内容'));
       } catch (e) {
         done(false, e instanceof Error ? e : new Error(String(e)));
       }

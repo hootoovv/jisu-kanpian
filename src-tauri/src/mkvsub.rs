@@ -1,25 +1,25 @@
-//! 极速看片 —— MKV 内嵌字幕提取（后端双引擎：ffmpeg 优先 / 原生 EBML 兜底）
+//! 极速看片 —— MKV 内嵌字幕提取（索引跳跃会话 + 全量走读双引擎）
 //!
-//! 背景：v1.0.4 把 MKV 字幕提取搬进了前端流式（read_range 分块喂
-//! matroska-subtitles），解决了「文件过大」的硬限制，但 5GB 级文件需要
-//! 把全部字节经 IPC 传进 WebView 再用 JS 解析，速度受 IPC 序列化与 JS
-//! 单线程解析双重拖累（分钟级）。本模块把提取下沉到 Rust 侧：
+//! v1.0.7 架构（删除 ffmpeg 引擎：实测被索引跳跃全面超越——9.9GB
+//! 蓝光重封装 MKV 在 5400rpm HDD 上 ffmpeg 全量 demux ~183s，索引
+//! 跳跃冷 ~44s / 热 ~0.5s；SSD 上 33s vs ~4s；且免去外部依赖与
+//! 跨平台探测的全部复杂度）：
 //!
-//! 引擎 1（ffmpeg）：机器上装了 ffmpeg 时优先使用（跨平台显式解析：
-//!   Windows 探测 PATH 与应用目录下的 ffmpeg.exe，Unix 找 PATH 里的
-//!   ffmpeg；逐候选 `-version` 验证，坏的应用执行别名自动跳过）——
-//!   `ffmpeg -i <file> -map 0:s:<n> -c:s copy -f srt/ass/webvtt pipe:1`
-//!   纯 demux + copy，无转码，5GB 文件秒级完成；输出直接是完整字幕
-//!   文档（srt/ass/vtt 文本），前端零解析成本。
-//! 引擎 2（原生 EBML）：机器上没有 ffmpeg 时使用——手写流式 EBML
-//!   游走（与前端 tracks.js 同一套元素子集），顺序扫描 Segment 的
-//!   Cluster/BlockGroup，只把目标字幕轨的块 payload 读进内存（通常
-//!   几 KB~几 MB），视频/音频块用 seek 直接跳过。解析在原生代码里
-//!   完成，速度只受磁盘顺序读限制，比「JS + IPC」快 1~2 个数量级。
-//! 引擎 3（前端 JS 流式）：以上两者都失败（如罕见的 lacing 分帧 /
-//!   ffmpeg 损坏）时，由前端 subtitles.js 回退到 v1.0.4 的兼容路径。
+//! 引擎 ①（索引会话）：Matroska 的 Cues 索引记录每条轨道每个块的
+//!   (Cluster 位置, 块内偏移)。subtitle_session_open 解析 SeekHead +
+//!   Cues（几百 KB、亚秒级），目标轨的位置表常驻内存（几十 KB）；
+//!   之后 subtitle_window(from, to) 按播放进度窗口化直跳取块——
+//!   只碰窗口内字幕块的几十 KB 字节，不顺序扫全文件。播放中每
+//!   ~90s 补一窗，seek 直接查新位置窗口，首屏字幕亚秒级可用。
+//! 引擎 ②（原生全量走读）：无 Cues / 索引缺 rel 定位（罕见封装，
+//!   如 mkvmerge --no-cues）时的兜底——手写流式 EBML 游走顺序扫
+//!   Segment 的 Cluster/BlockGroup，只把目标轨字幕块读进内存
+//!   （通常几 KB~几 MB），视频/音频块用 seek 直接跳过，一次性
+//!   返回全部块（进度按文件偏移报百分比）。
+//! 引擎 ③（前端 JS 流式）：② 也失败（罕见 lacing 分帧 / 容器损伤）
+//!   时由前端 subtitles.js 回退 v1.0.4 的 matroska-subtitles 兼容路径。
 //!
-//! 语义对齐（与 matroska-subtitles 完全一致，保证两条路径产出相同）：
+//! 语义对齐（各引擎完全一致，保证任何路径产出相同）：
 //! - 字幕事件只来自 BlockGroup(0xA0)→Block(0xA1)（带 BlockDuration
 //!   0x9B），SimpleBlock(0xA3) 不产字幕（ffmpeg / mkvmerge 均按此封装）；
 //! - time = (Cluster.Timestamp + Block 相对时码) × TimecodeScale / 1e6（ms）；
@@ -27,30 +27,24 @@
 //! - ASS/SSA 块 payload 是逗号分隔字段：
 //!   [ReadOrder,]Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 //!   （SSA 比 ASS 多跳过一个前导字段），Text 内的逗号重新拼回。
+//! - 索引侧：CueTime 只用于窗口选择；块时间仍取「簇时码 + 块相对
+//!   时码」的权威计算（每簇时码在会话内跨窗口缓存；实测 MakeMKV
+//!   蓝光重封装两者 973/973 一致）。CueRelativePosition 的基准是
+//!   Cluster 数据区起点（ID + 尺寸头之后），不是元素起点。
 //!
-//! 进度：提取在 spawn_blocking 里跑，进度经原子静态暴露给
-//! query_extract_progress 命令，前端 await 期间轮询展示百分比
-//! （原生引擎按文件偏移；ffmpeg 引擎无法取内部进度，展示引擎名）。
+//! 会话：位置表 + 簇时码缓存挂在进程内会话表（上限 8 个，超出逐出
+//! 最旧），切轨 / 切文件由前端 subtitle_close 显式关闭。
 
 use serde::Serialize;
-use std::ffi::OsStr;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{mpsc, OnceLock};
-use std::thread;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 
-/* ================= 进度（前端轮询） ================= */
-
-const M_NONE: u8 = 0;
-const M_FFMPEG: u8 = 1;
-const M_NATIVE: u8 = 2;
+/* ================= 进度（引擎 ② 全量走读，前端轮询） ================= */
 
 static P_RUNNING: AtomicBool = AtomicBool::new(false);
-static P_METHOD: AtomicU8 = AtomicU8::new(M_NONE);
 static P_BYTES: AtomicU64 = AtomicU64::new(0);
 static P_TOTAL: AtomicU64 = AtomicU64::new(0);
 
@@ -59,21 +53,18 @@ static P_TOTAL: AtomicU64 = AtomicU64::new(0);
 #[serde(rename_all = "camelCase")]
 pub struct ProgressSnapshot {
     pub running: bool,
-    /// none | ffmpeg | native
-    pub method: &'static str,
     pub bytes: u64,
     pub total: u64,
 }
 
-/// 提取任务开始（extract_mkv_subtitles 命令入口调用）
+/// 全量提取任务开始（extract_mkv_subtitles 命令入口调用）
 pub fn progress_begin() {
     P_RUNNING.store(true, Ordering::SeqCst);
-    P_METHOD.store(M_NONE, Ordering::SeqCst);
     P_BYTES.store(0, Ordering::SeqCst);
     P_TOTAL.store(0, Ordering::SeqCst);
 }
 
-/// 提取任务结束（含失败路径，命令出口调用）
+/// 全量提取任务结束（含失败路径，命令出口调用）
 pub fn progress_end() {
     P_RUNNING.store(false, Ordering::SeqCst);
 }
@@ -82,18 +73,9 @@ pub fn progress_end() {
 pub fn progress_snapshot() -> ProgressSnapshot {
     ProgressSnapshot {
         running: P_RUNNING.load(Ordering::SeqCst),
-        method: match P_METHOD.load(Ordering::SeqCst) {
-            M_FFMPEG => "ffmpeg",
-            M_NATIVE => "native",
-            _ => "none",
-        },
         bytes: P_BYTES.load(Ordering::SeqCst),
         total: P_TOTAL.load(Ordering::SeqCst),
     }
-}
-
-fn set_method(m: u8) {
-    P_METHOD.store(m, Ordering::SeqCst);
 }
 
 fn set_bytes(b: u64) {
@@ -106,7 +88,7 @@ fn set_total(t: u64) {
 
 /* ================= 结果类型（serde → JSON） ================= */
 
-/// 一条字幕块（native 引擎产出；字段与 matroska-subtitles 对齐）
+/// 一条字幕块（引擎 ①② 产出；字段与 matroska-subtitles 对齐）
 #[derive(Serialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SubBlock {
@@ -129,16 +111,14 @@ pub struct SubBlock {
     pub effect: String,
 }
 
-/// extract_mkv_subtitles 的返回
+/// extract_mkv_subtitles 的返回（引擎 ② 全量走读）
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtractResult {
-    /// ffmpeg | native（前端 ③ 兜底时为 js，由前端自行标记）
+    /// native（引擎 ②；前端 ③ 兜底时为 js，由前端自行标记）
     pub method: &'static str,
     /// utf8 | webvtt | ass
     pub kind: String,
-    /// ffmpeg 引擎：完整字幕文档文本（srt / ass / vtt）
-    pub text: Option<String>,
     /// native 引擎：ASS 头（CodecPrivate）
     pub header: Option<String>,
     /// native 引擎：字幕块列表
@@ -146,9 +126,20 @@ pub struct ExtractResult {
 }
 
 /* ================= Matroska 元素 ID（本模块用到的子集） ================= */
-// （跳过而不解析的元素不占常量位：EBML 头 0x1A45DFA3、SimpleBlock
-//  0xA3 等在走读的 else/skip 分支按「未识别即跳过」处理，见注释）
+// （跳过而不解析的元素不占常量位：EBML 头 0x1A45DFA3 等在走读的
+//  else/skip 分支按「未识别即跳过」处理，见注释）
 const ID_SEGMENT: u64 = 0x18538067;
+const ID_SEEKHEAD: u64 = 0x114d9b74;
+const ID_SEEK: u64 = 0x4dbb;
+const ID_SEEK_ID: u64 = 0x53ab;
+const ID_SEEK_POS: u64 = 0x53ac;
+const ID_CUES: u64 = 0x1c53bb6b;
+const ID_CUE_POINT: u64 = 0xbb;
+const ID_CUE_TIME: u64 = 0xb3;
+const ID_CUE_TRACKPOS: u64 = 0xb7;
+const ID_CUE_TRACK: u64 = 0xf7;
+const ID_CUE_CLUSTER_POS: u64 = 0xf1;
+const ID_CUE_REL_POS: u64 = 0xf0;
 const ID_INFO: u64 = 0x1549a966;
 const ID_TIMECODE_SCALE: u64 = 0x2ad7b1;
 const ID_TRACKS: u64 = 0x1654ae6b;
@@ -161,6 +152,7 @@ const ID_CLUSTER: u64 = 0x1f43b675;
 const ID_TIMESTAMP: u64 = 0xe7;
 const ID_BLOCK_GROUP: u64 = 0xa0;
 const ID_BLOCK: u64 = 0xa1;
+const ID_SIMPLE_BLOCK: u64 = 0xa3;
 const ID_BLOCK_DURATION: u64 = 0x9b;
 
 /// TrackType：0x11 = 字幕
@@ -170,8 +162,10 @@ const TRACK_SUBTITLE: u64 = 0x11;
 const BUF: usize = 1 << 20;
 /// 目标块 payload 上限（正常字幕块仅几 KB；防御损坏文件的天量分配）
 const MAX_SUB_PAYLOAD: u64 = 64 << 20;
-/// ffmpeg 整体超时（demux 50GB @ HDD 量级的保守值）
-const FFMPEG_TIMEOUT: Duration = Duration::from_secs(600);
+/// 无可用索引（引擎 ① 不可用，前端据此降级引擎 ② 全量走读）
+const ERR_NO_INDEX: &str = "该文件没有可用的 Cues 索引";
+/// 会话表上限：超出逐出最旧（前端异常路径不关会话也不至于泄漏）
+const SESSION_CAP: usize = 8;
 
 /// CodecID → 字幕类型（与前端 tracks.js subtitleKindOf 一致）
 fn kind_of(codec_id: &str) -> Option<&'static str> {
@@ -343,7 +337,7 @@ fn skip_to(r: &mut BufReader<File>, pos: u64) -> io::Result<()> {
     Ok(())
 }
 
-/* ================= 走读 ================= */
+/* ================= 走读（引擎 ② 全量 + ① 的头部/轨道解析） ================= */
 
 /// 轨道表条目（TrackEntry 感兴趣的子集）
 #[derive(Clone, Debug, Default)]
@@ -359,7 +353,7 @@ struct TrackMeta {
 struct WalkOut {
     /// Info.TimecodeScale（ns/单位，默认 1e6）
     scale: u64,
-    /// Tracks.TrackEntry 列表（按容器顺序 = ffmpeg 流顺序）
+    /// Tracks.TrackEntry 列表（按容器顺序）
     metas: Vec<TrackMeta>,
     /// 目标轨字幕块（full 模式）
     blocks: Vec<SubBlock>,
@@ -377,7 +371,7 @@ impl WalkOut {
 }
 
 /// 顶层走读入口。
-/// `target = None`：头模式——解析到 Tracks 完成即止（ffmpeg 引擎选轨用）；
+/// `target = None`：头模式——解析到 Tracks 完成即止（选轨 / 判型用）；
 /// `target = Some(n)`：全量模式——继续扫全部 Cluster 收集目标轨字幕块。
 fn walk_mkv(r: &mut BufReader<File>, file_len: u64, target: Option<u64>) -> Result<WalkOut, String> {
     let mut out = WalkOut::new();
@@ -614,197 +608,10 @@ fn perr(e: io::Error) -> String {
     format!("读取 MKV 失败：{e}")
 }
 
-/* ================= 引擎 1：ffmpeg ================= */
+/* ================= 引擎 ②：原生全量走读 ================= */
 
-/// Windows 下抑制子进程控制台窗口（Tauri GUI 应用 spawn 控制台程序会闪黑窗）
-#[cfg(windows)]
-fn no_console_window(cmd: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    cmd.creation_flags(CREATE_NO_WINDOW);
-}
-#[cfg(not(windows))]
-fn no_console_window(_cmd: &mut Command) {}
-
-/* ---------- ffmpeg 解析（跨平台：Windows 显式 ffmpeg.exe） ---------- */
-
-/// 解析 ffmpeg 可执行文件路径（结果缓存，进程生命周期内只探测一次）。
-///
-/// 搜索序（`ffmpeg_search_dirs` × `ffmpeg_candidate_names`）：
-/// 1. Windows 先查「应用 exe 同目录」——便携部署（把 ffmpeg.exe 放在
-///    播放器旁边）无需配置 PATH 即可被找到；
-/// 2. 再查 PATH 各目录：Windows 找 `ffmpeg.exe`（NTFS 大小写不敏感，
-///    `FFMPEG.EXE` 等变体天然命中；无扩展名的 `ffmpeg` 形态兜底），
-///    Unix 找 `ffmpeg` 且要求可执行位；
-/// 3. 每个命中的候选先跑 `-version` 验证可运行性——Windows 应用执行
-///    别名（WindowsApps 下的零字节残影 stub）文件存在却无法启动，
-///    逐候选验证可自动跳过坏别名，不挡 PATH 里靠后的真 ffmpeg。
-///
-/// 空的 PATH 项（shell 语义 = 当前目录）跳过，不搜 CWD。
-/// 解析结果缓存后在 extract_ffmpeg 里直接作为程序路径调用，
-/// 不再依赖 CreateProcess / posix_spawn 的按名搜索语义。
-fn ffmpeg_exe() -> Option<&'static Path> {
-    static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
-    CACHE.get_or_init(find_ffmpeg).as_deref()
-}
-
-/// 机器上有可用的 ffmpeg 吗（探测结果缓存）
-fn ffmpeg_available() -> bool {
-    ffmpeg_exe().is_some()
-}
-
-/// 候选文件名：Windows 显式带 `.exe` 扩展名（winget / scoop / choco /
-/// 官方构建在 Windows 上的分发形态一律是 ffmpeg.exe）
-fn ffmpeg_candidate_names() -> &'static [&'static str] {
-    if cfg!(windows) {
-        &["ffmpeg.exe", "ffmpeg"]
-    } else {
-        &["ffmpeg"]
-    }
-}
-
-/// PATH 值 → 搜索目录序列（跳过空项；不读 env 的纯函数，便于单测）
-fn dirs_from_path(path_var: &OsStr) -> Vec<PathBuf> {
-    std::env::split_paths(path_var)
-        .filter(|d| !d.as_os_str().is_empty())
-        .collect()
-}
-
-/// 目录搜索序：Windows 应用目录优先（便携部署），随后 PATH 各项
-fn ffmpeg_search_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if cfg!(windows) {
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                dirs.push(dir.to_path_buf());
-            }
-        }
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        dirs.extend(dirs_from_path(&path));
-    }
-    dirs
-}
-
-/// 候选文件是否具备启动条件（存在、是普通文件；Unix 还要求可执行位）
-fn is_runnable_candidate(p: &Path) -> bool {
-    let Ok(md) = std::fs::metadata(p) else {
-        return false;
-    };
-    if !md.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // owner / group / other 任一可执行位即可
-        if md.permissions().mode() & 0o111 == 0 {
-            return false;
-        }
-    }
-    true
-}
-
-/// 试跑 `-version`：坏别名（WindowsApps 残影 stub）、架构不符的
-/// 二进制在此过滤（能启动但退出非 0 同样不算可用）
-fn probe_ffmpeg(exe: &Path) -> bool {
-    let mut cmd = Command::new(exe);
-    cmd.arg("-version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    no_console_window(&mut cmd);
-    cmd.status().map(|s| s.success()).unwrap_or(false)
-}
-
-fn find_ffmpeg() -> Option<PathBuf> {
-    for dir in ffmpeg_search_dirs() {
-        for name in ffmpeg_candidate_names() {
-            let cand = dir.join(name);
-            if is_runnable_candidate(&cand) && probe_ffmpeg(&cand) {
-                return Some(cand);
-            }
-        }
-    }
-    None
-}
-
-/// 用 ffmpeg 提取第 sub_index 条字幕轨（0 起，按容器轨道顺序），
-/// `-c:s copy` 纯封装拷贝直写 stdout（无临时文件、无转码）。
-fn extract_ffmpeg(path: &str, sub_index: usize, kind: &str, file_len: u64) -> Result<ExtractResult, String> {
-    // 直接用解析缓存里的绝对路径：Windows 上不依赖 CreateProcess
-    // 的按名搜索（其搜索序含 CWD，且对 .exe / .bat 的解析不可控）
-    let exe = ffmpeg_exe().ok_or("未找到可用的 ffmpeg")?;
-    set_method(M_FFMPEG);
-    set_total(file_len);
-    set_bytes(0);
-    let fmt = match kind {
-        "ass" => "ass",
-        "webvtt" => "webvtt",
-        _ => "srt",
-    };
-    let mut cmd = Command::new(exe);
-    cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", path])
-        .arg("-map")
-        .arg(format!("0:s:{sub_index}"))
-        .args(["-c:s", "copy", "-f", fmt, "pipe:1"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    no_console_window(&mut cmd);
-    let mut child = cmd.spawn().map_err(|e| format!("ffmpeg 启动失败：{e}"))?;
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    // stdout / stderr 双线程收流（防管道写满死锁）+ 看门狗超时击杀
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    let th_out = thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = stdout.read_to_end(&mut v);
-        let _ = tx.send(v);
-    });
-    let th_err = thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = stderr.read_to_end(&mut v);
-        v
-    });
-    let out = match rx.recv_timeout(FFMPEG_TIMEOUT) {
-        Ok(v) => v,
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("ffmpeg 提取超时".into());
-        }
-    };
-    let err = th_err.join().unwrap_or_default();
-    let _ = th_out.join();
-    let status = child.wait().map_err(|e| format!("ffmpeg 等待失败：{e}"))?;
-    if !status.success() {
-        let msg = String::from_utf8_lossy(&err);
-        let msg = msg.trim();
-        return Err(if msg.is_empty() {
-            format!("ffmpeg 退出码 {status}")
-        } else {
-            format!("ffmpeg：{msg}")
-        });
-    }
-    let text = String::from_utf8_lossy(&out).trim().to_string();
-    if text.is_empty() {
-        return Err("ffmpeg 未输出字幕内容".into());
-    }
-    Ok(ExtractResult {
-        method: "ffmpeg",
-        kind: kind.to_string(),
-        text: Some(text),
-        header: None,
-        blocks: None,
-    })
-}
-
-/* ================= 引擎 2：原生 EBML ================= */
-
-/// 原生流式提取目标字幕轨（full 走读：内存只驻留字幕块，与文件大小无关）
+/// 全量流式提取目标字幕轨（full 走读：内存只驻留字幕块，与文件大小无关）
 fn extract_native(path: &str, track_number: u64, file_len: u64) -> Result<ExtractResult, String> {
-    set_method(M_NATIVE);
     set_total(file_len);
     set_bytes(0);
     let file = File::open(path).map_err(|e| format!("打开文件失败：{e}"))?;
@@ -820,7 +627,6 @@ fn extract_native(path: &str, track_number: u64, file_len: u64) -> Result<Extrac
     Ok(ExtractResult {
         method: "native",
         kind: out.t_kind.clone(),
-        text: None,
         header: if is_ass {
             Some(String::from_utf8_lossy(&out.t_private).to_string())
         } else {
@@ -830,12 +636,9 @@ fn extract_native(path: &str, track_number: u64, file_len: u64) -> Result<Extrac
     })
 }
 
-/* ================= 入口：三级引擎调度（命令层调用） ================= */
-
-/// 提取一条 MKV 内嵌字幕轨：
-/// ① 解析到 ffmpeg（PATH / Windows 应用目录，见 ffmpeg_exe）→ ffmpeg 提取（最快）；
-/// ② 失败 / 无 ffmpeg → 原生 EBML 流式解析；
-/// 两者都失败 → Err（前端收到后回退 JS 流式兜底）。
+/// 提取一条 MKV 内嵌字幕轨（引擎 ②：一次性全量走读）。
+/// 无索引文件（引擎 ① 不可用）时的兜底路径；两者都失败 → Err
+/// （前端收到后回退 JS 流式兜底）。
 pub fn extract_auto(path: &str, track_number: u64) -> Result<ExtractResult, String> {
     let file_len = std::fs::metadata(path)
         .map_err(|e| format!("读取文件信息失败：{e}"))?
@@ -843,7 +646,7 @@ pub fn extract_auto(path: &str, track_number: u64) -> Result<ExtractResult, Stri
     if file_len == 0 {
         return Err("文件为空".into());
     }
-    // 头模式走读：只到 Tracks（选轨 / 判型 / ffmpeg 序号），不扫 Cluster
+    // 头模式走读：只到 Tracks（选轨 / 判型），不扫 Cluster
     let file = File::open(path).map_err(|e| format!("打开文件失败：{e}"))?;
     let mut r = BufReader::with_capacity(BUF, file);
     let head = walk_mkv(&mut r, file_len, None)?;
@@ -855,22 +658,378 @@ pub fn extract_auto(path: &str, track_number: u64) -> Result<ExtractResult, Stri
     if target.kind != TRACK_SUBTITLE {
         return Err("指定的轨道不是字幕轨".into());
     }
-    let kind = kind_of(&target.codec_id)
+    kind_of(&target.codec_id)
         .ok_or("未适配的字幕格式（PGS / VOBSub 等图形字幕暂不支持）")?;
-    // ffmpeg 的流序号 = 字幕轨在容器轨道顺序中的位置（0 起）
-    let sub_index = head
+    extract_native(path, track_number, file_len)
+}
+
+/* ================= 引擎 ①：Cues 索引会话（窗口化跳跃提取） ================= */
+
+/// 一条索引命中：目标轨某字幕块的定位
+#[derive(Clone, Copy, Debug)]
+struct CueHit {
+    /// 窗口选择用时间（CueTime × scale / 1e6）
+    cue_ms: u64,
+    /// CueClusterPosition（相对 Segment 数据区）
+    cluster: u64,
+    /// CueRelativePosition（相对 Cluster 数据区）
+    rel: u64,
+}
+
+/// 打开的字幕会话（位置表常驻内存，几十 KB 量级）
+struct SubtitleSession {
+    path: String,
+    file_len: u64,
+    /// Segment 数据区绝对起点（索引偏移的换算基准）
+    seg_data: u64,
+    scale: u64,
+    track_number: u64,
+    kind: &'static str,
+    ssa: bool,
+    /// ASS 头（CodecPrivate）
+    header: Option<String>,
+    /// 按 cue_ms 升序的命中表
+    hits: Vec<CueHit>,
+    /// 簇头缓存（cluster → (簇数据区绝对偏移, Timecode)），跨窗口复用
+    cluster_cache: HashMap<u64, (u64, u64)>,
+}
+
+/// subtitle_session_open 的返回
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfo {
+    pub session_id: u64,
+    /// utf8 | webvtt | ass
+    pub kind: String,
+    /// ASS 头（CodecPrivate；非 ASS 轨为 None）
+    pub header: Option<String>,
+    /// 索引命中数（≈ 该轨字幕块总数）
+    pub total_blocks: usize,
+}
+
+/// subtitle_window 的返回
+#[derive(Serialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowResult {
+    pub blocks: Vec<SubBlock>,
+    /// 定位失败被跳过的索引条数（>0 时前端应降级全量提取保证完整性）
+    pub skipped: u32,
+}
+
+static SESSIONS: Mutex<BTreeMap<u64, SubtitleSession>> = Mutex::new(BTreeMap::new());
+static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+
+/// Cues 解析的中间结构（全部轨道；命中表只留目标轨）
+#[derive(Clone, Debug)]
+struct CueEntry {
+    time: u64,
+    track: u64,
+    cluster: u64,
+    rel: Option<u64>,
+}
+
+fn parse_seekhead(r: &mut BufReader<File>, end: u64, found: &mut Vec<(u64, u64)>) -> Result<(), String> {
+    while r.stream_position().map_err(perr)? < end {
+        let Some(e) = read_elem(r).map_err(perr)? else { break };
+        let child_end = elem_end(&e, end);
+        if e.id == ID_SEEK {
+            let mut sid = 0u64;
+            let mut spos = 0u64;
+            while r.stream_position().map_err(perr)? < child_end {
+                let Some(c) = read_elem(r).map_err(perr)? else { break };
+                let ce = elem_end(&c, child_end);
+                if c.id == ID_SEEK_ID {
+                    sid = read_uint(r, c.size).map_err(perr)?;
+                } else if c.id == ID_SEEK_POS {
+                    spos = read_uint(r, c.size).map_err(perr)?;
+                } else {
+                    skip_to(r, ce).map_err(perr)?;
+                }
+            }
+            found.push((sid, spos));
+        }
+        skip_to(r, child_end).map_err(perr)?;
+    }
+    Ok(())
+}
+
+fn parse_cues(r: &mut BufReader<File>, end: u64, out: &mut Vec<CueEntry>) -> Result<(), String> {
+    while r.stream_position().map_err(perr)? < end {
+        let Some(e) = read_elem(r).map_err(perr)? else { break };
+        let child_end = elem_end(&e, end);
+        if e.id == ID_CUE_POINT {
+            let mut time = 0u64;
+            while r.stream_position().map_err(perr)? < child_end {
+                let Some(c) = read_elem(r).map_err(perr)? else { break };
+                let ce = elem_end(&c, child_end);
+                if c.id == ID_CUE_TIME {
+                    time = read_uint(r, c.size).map_err(perr)?;
+                } else if c.id == ID_CUE_TRACKPOS {
+                    let mut track = 0u64;
+                    let mut cluster = 0u64;
+                    let mut rel = None;
+                    while r.stream_position().map_err(perr)? < ce {
+                        let Some(d) = read_elem(r).map_err(perr)? else { break };
+                        let de = elem_end(&d, ce);
+                        match d.id {
+                            ID_CUE_TRACK => track = read_uint(r, d.size).map_err(perr)?,
+                            ID_CUE_CLUSTER_POS => cluster = read_uint(r, d.size).map_err(perr)?,
+                            ID_CUE_REL_POS => rel = Some(read_uint(r, d.size).map_err(perr)?),
+                            _ => skip_to(r, de).map_err(perr)?,
+                        }
+                    }
+                    out.push(CueEntry { time, track, cluster, rel });
+                    skip_to(r, ce).map_err(perr)?;
+                } else {
+                    skip_to(r, ce).map_err(perr)?;
+                }
+            }
+        }
+        skip_to(r, child_end).map_err(perr)?;
+    }
+    Ok(())
+}
+
+/// 读某 Cluster 的元素头与 Timecode。返回 (簇数据区绝对偏移, Timecode)。
+/// CueRelativePosition 的基准是簇数据区起点（ID + 尺寸头之后）。
+fn cluster_head(r: &mut BufReader<File>, cluster_abs: u64, file_len: u64) -> Result<(u64, u64), String> {
+    skip_to(r, cluster_abs).map_err(perr)?;
+    let Some(e) = read_elem(r).map_err(perr)? else {
+        return Err("索引指向的 Cluster 不存在".into());
+    };
+    let data_pos = if e.unknown { cluster_abs } else { e.data_pos };
+    // Timecode 正常是簇的第一个子元素；限定在簇头附近找（防御病态封装）
+    let guard = e.data_pos.saturating_add(e.size.min(65536)).min(file_len);
+    while r.stream_position().map_err(perr)? < guard {
+        let Some(c) = read_elem(r).map_err(perr)? else { break };
+        let ce = elem_end(&c, guard);
+        if c.id == ID_TIMESTAMP {
+            return Ok((data_pos, read_uint(r, c.size).map_err(perr)?));
+        }
+        skip_to(r, ce).map_err(perr)?;
+    }
+    Ok((data_pos, 0))
+}
+
+/// 打开索引会话：解析 SeekHead + Cues，目标轨位置表常驻内存。
+/// 定性错误（轨道不存在 / 非字幕轨 / 格式未适配 / 空文件）与
+/// extract_auto 文案一致（前端按同套判据短路）；索引不可用报
+/// ERR_NO_INDEX（前端据此降级引擎 ②）。
+pub fn session_open(path: &str, track_number: u64) -> Result<SessionInfo, String> {
+    let file_len = std::fs::metadata(path)
+        .map_err(|e| format!("读取文件信息失败：{e}"))?
+        .len();
+    if file_len == 0 {
+        return Err("文件为空".into());
+    }
+    let file = File::open(path).map_err(|e| format!("打开文件失败：{e}"))?;
+    let mut r = BufReader::with_capacity(BUF, file);
+
+    // 顶层：EBML 头 →（顶层 SeekHead，若有）→ Segment 头
+    let mut seeks: Vec<(u64, u64)> = Vec::new(); // (元素ID, 相对 Segment 数据区)
+    let mut seg_data = 0u64;
+    let mut seg_end = file_len;
+    loop {
+        let Some(e) = read_elem(&mut r).map_err(perr)? else { break };
+        let end = elem_end(&e, file_len);
+        if e.id == ID_SEEKHEAD {
+            parse_seekhead(&mut r, end, &mut seeks)?;
+        } else if e.id == ID_SEGMENT {
+            seg_data = e.data_pos;
+            seg_end = end;
+            break;
+        } else {
+            skip_to(&mut r, end).map_err(perr)?;
+        }
+    }
+
+    // Segment 子元素：SeekHead（MakeMKV / ffmpeg 放段内，mkvmerge 放
+    // 顶层——两种都收）/ Info / Tracks 正常解析，其余（Cluster 等）只读
+    // 元素头即跳。拿到轨道表 + Cues 位置（SeekHead 指路或逐头扫到）即止
+    let mut head = WalkOut::new();
+    let mut cues_abs: Option<u64> = None;
+    while r.stream_position().map_err(perr)? < seg_end {
+        let Some(c) = read_elem(&mut r).map_err(perr)? else { break };
+        let child_end = elem_end(&c, seg_end);
+        match c.id {
+            ID_SEEKHEAD => parse_seekhead(&mut r, child_end, &mut seeks)?,
+            ID_INFO => walk_info(&mut r, child_end, &mut head)?,
+            ID_TRACKS => walk_tracks(&mut r, child_end, &mut head)?,
+            ID_CUES => {
+                cues_abs = Some(c.data_pos);
+                if head.metas.is_empty() {
+                    skip_to(&mut r, child_end).map_err(perr)?; // 病态序：Cues 在 Tracks 前
+                } else {
+                    break;
+                }
+            }
+            _ => skip_to(&mut r, child_end).map_err(perr)?, // Cluster 只跳元素头
+        }
+        if !head.metas.is_empty() && cues_abs.is_none() {
+            if let Some((_, p)) = seeks.iter().find(|(id, _)| *id == ID_CUES) {
+                cues_abs = Some(seg_data + p);
+                break;
+            }
+        }
+    }
+
+    // 定性校验（文案与 extract_auto 一致）
+    let target = head
         .metas
         .iter()
-        .filter(|m| m.kind == TRACK_SUBTITLE)
-        .position(|m| m.number == track_number)
-        .unwrap_or(0);
-    if ffmpeg_available() {
-        if let Ok(res) = extract_ffmpeg(path, sub_index, kind, file_len) {
-            return Ok(res);
-        }
-        // ffmpeg 失败（个别封装 / 映射不兼容）→ 原生引擎接手
+        .find(|m| m.number == track_number)
+        .ok_or("找不到指定的字幕轨")?;
+    if target.kind != TRACK_SUBTITLE {
+        return Err("指定的轨道不是字幕轨".into());
     }
-    extract_native(path, track_number, file_len)
+    let kind = kind_of(&target.codec_id)
+        .ok_or("未适配的字幕格式（PGS / VOBSub 等图形字幕暂不支持）")?;
+
+    // 索引可用性：无 Cues / 指向异常 / 目标轨无条目 / 任一条目缺 rel
+    // 定位 → 整体放弃（不部分跳跃，防止悄悄漏字幕）
+    let Some(cues_at) = cues_abs else {
+        return Err(ERR_NO_INDEX.into());
+    };
+    skip_to(&mut r, cues_at).map_err(perr)?;
+    let Some(e) = read_elem(&mut r).map_err(perr)? else {
+        return Err(ERR_NO_INDEX.into());
+    };
+    if e.id != ID_CUES {
+        return Err(ERR_NO_INDEX.into());
+    }
+    let mut entries = Vec::new();
+    parse_cues(&mut r, elem_end(&e, file_len), &mut entries)?;
+    let mut hits: Vec<CueHit> = Vec::new();
+    for c in entries.iter().filter(|c| c.track == track_number) {
+        let Some(rel) = c.rel else {
+            return Err(ERR_NO_INDEX.into());
+        };
+        hits.push(CueHit {
+            cue_ms: (c.time as u128 * head.scale as u128 / 1_000_000) as u64,
+            cluster: c.cluster,
+            rel,
+        });
+    }
+    if hits.is_empty() {
+        return Err(ERR_NO_INDEX.into());
+    }
+    hits.sort_unstable_by(|a, b| (a.cue_ms, a.cluster, a.rel).cmp(&(b.cue_ms, b.cluster, b.rel)));
+    hits.dedup_by(|a, b| a.cluster == b.cluster && a.rel == b.rel);
+
+    let info = SessionInfo {
+        session_id: NEXT_SESSION.fetch_add(1, Ordering::SeqCst),
+        kind: kind.to_string(),
+        header: if kind == "ass" {
+            Some(String::from_utf8_lossy(&target.codec_private).to_string())
+        } else {
+            None
+        },
+        total_blocks: hits.len(),
+    };
+    let session = SubtitleSession {
+        path: path.to_string(),
+        file_len,
+        seg_data,
+        scale: head.scale,
+        track_number,
+        kind,
+        ssa: is_ssa(&target.codec_id),
+        header: info.header.clone(),
+        hits,
+        cluster_cache: HashMap::new(),
+    };
+    let mut map = SESSIONS.lock().map_err(|_| "字幕会话表锁定失败")?;
+    while map.len() >= SESSION_CAP {
+        map.pop_first(); // 逐出最旧（id 最小）
+    }
+    map.insert(info.session_id, session);
+    Ok(info)
+}
+
+/// 取一个播放窗口的字幕块：命中表按 cue_ms 二分出 [from_ms, to_ms)
+/// 的条目，按文件偏移排序后逐条直跳（只碰窗口内块的几十 KB 字节）。
+/// 返回 skipped > 0 表示有索引条目定位失败，前端应降级全量提取。
+pub fn session_window(session_id: u64, from_ms: u64, to_ms: u64) -> Result<WindowResult, String> {
+    let mut map = SESSIONS.lock().map_err(|_| "字幕会话表锁定失败")?;
+    let Some(s) = map.get_mut(&session_id) else {
+        return Err("字幕会话已失效".into());
+    };
+    let lo = s.hits.partition_point(|h| h.cue_ms < from_ms);
+    let hi = s.hits.partition_point(|h| h.cue_ms < to_ms);
+    if lo >= hi {
+        return Ok(WindowResult::default()); // 空窗（无对白的时段）
+    }
+    // 拷出命中后按 (cluster, rel) 排序：文件偏移升序 ≈ 磁头顺扫
+    let mut sel: Vec<CueHit> = s.hits[lo..hi].to_vec();
+    sel.sort_unstable_by_key(|h| (h.cluster, h.rel));
+
+    let file = File::open(&s.path).map_err(|e| format!("打开文件失败：{e}"))?;
+    let mut r = BufReader::with_capacity(BUF, file);
+    let mut walk = WalkOut {
+        scale: s.scale,
+        t_found: true,
+        t_kind: s.kind.to_string(),
+        t_ssa: s.ssa,
+        ..Default::default()
+    };
+    let mut skipped: u32 = 0;
+    for h in &sel {
+        let (cdata, tc) = match s.cluster_cache.get(&h.cluster) {
+            Some(v) => *v,
+            None => {
+                let v = cluster_head(&mut r, s.seg_data + h.cluster, s.file_len)?;
+                s.cluster_cache.insert(h.cluster, v);
+                v
+            }
+        };
+        skip_to(&mut r, cdata + h.rel).map_err(perr)?;
+        let Some(b) = read_elem(&mut r).map_err(perr)? else {
+            skipped += 1;
+            continue;
+        };
+        let bend = if b.unknown {
+            b.data_pos + (1 << 20)
+        } else {
+            b.data_pos + b.size
+        };
+        match b.id {
+            ID_BLOCK_GROUP => {
+                match walk_block_group(&mut r, bend.min(s.file_len), tc, s.track_number, &mut walk) {
+                    Ok(()) => {}
+                    Err(_) => skipped += 1, // lacing / 尺寸异常等：计入跳过，前端降级
+                }
+            }
+            // 个别封装的索引直指裸 Block / SimpleBlock（无 BlockDuration）
+            ID_BLOCK | ID_SIMPLE_BLOCK => {
+                match read_block_head(&mut r, b.size) {
+                    Ok((track, rel, flags, plen)) if track == s.track_number && flags & 0x06 == 0 => {
+                        match read_bytes(&mut r, plen) {
+                            Ok(payload) => {
+                                let units = tc as i128 + rel as i128;
+                                let time = (units.max(0) * s.scale as i128 / 1_000_000) as u64;
+                                walk.blocks.push(build_sub_block(payload, time, 0, s.kind, s.ssa));
+                            }
+                            Err(_) => skipped += 1,
+                        }
+                    }
+                    Ok(_) => {} // 非目标轨 / lacing：索引本应指向目标轨，略过
+                    Err(_) => skipped += 1,
+                }
+            }
+            _ => skipped += 1, // 定位点不是块元素（索引损坏 / 基准不符）
+        }
+    }
+    if skipped > 0 && walk.blocks.is_empty() {
+        return Err(format!("索引跳跃失败（{skipped} 条未命中）"));
+    }
+    Ok(WindowResult { blocks: walk.blocks, skipped })
+}
+
+/// 关闭会话（切轨 / 切文件时前端显式调用；幂等）
+pub fn session_close(session_id: u64) {
+    if let Ok(mut map) = SESSIONS.lock() {
+        map.remove(&session_id);
+    }
 }
 
 /* ================= 单元测试（独立 crate 亦可跑） ================= */

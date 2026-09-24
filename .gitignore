@@ -5,3 +5,5 @@ dist/
 npm-debug.log*
 src-tauri/target/
 src-tauri/gen/
+scripts/smoke/shots/
+bench/

@@ -1,16 +1,18 @@
 //! mkvsub.rs 单元测试 —— 合成 MKV 字节流驱动，不依赖外部工具与真实媒体。
 //!
 //! 覆盖面：
-//! - 原生解析：SRT 块时间/时长、ASS/SSA 字段拆分、双字节 TrackNumber、
-//!   未知尺寸 Segment（ffmpeg 01+00…00 形态）、视频块 seek 跳过；
-//! - 稀疏 4GB 大文件：验证大偏移 seek 与「内存只驻留字幕块」的流式语义；
-//! - ffmpeg 引擎：PATH 有 ffmpeg 时端到端（真实子进程），无则跳过；
-//! - 引擎降级：ffmpeg 失败 → 原生接手；
-//! - 真实媒体对照：环境变量 KP_TEST_MKV 指向 multi.mkv 时做已知内容断言。
+//! - 引擎 ②（全量走读）：SRT 块时间/时长、ASS/SSA 字段拆分、双字节
+//!   TrackNumber、未知尺寸 Segment（ffmpeg 01+00…00 形态）、视频块
+//!   seek 跳过、稀疏 4GB 大文件；
+//! - 引擎 ①（索引会话）：带 SeekHead + Cues 的合成 MKV 上——会话
+//!   打开、窗口与全量产出逐块一致、窗口边界互斥、ASS 字段经窗口
+//!   不丢、无索引降级标记、定性错误文案对齐、会话失效与逐出、
+//!   seek 空洞补窗；
+//! - 真实媒体对照：环境变量 KP_TEST_MKV 指向 multi.mkv 时做已知内容
+//!   断言（有索引时加验「全片窗口扫 == 全量」）。
 
 use super::*;
 use std::io::Write as _;
-use std::time::Instant;
 
 /* ---------------- EBML 写入辅助（测试专用） ---------------- */
 
@@ -27,6 +29,14 @@ fn vs(v: u64) -> Vec<u8> {
         }
     }
     unreachable!()
+}
+
+/// 定宽 4 字节原始大端 uint（值 < 2^32）。SeekPosition 的 payload 按
+/// 规范是普通 uint（非 vint）；SeekHead 在段首占位，其长度决定后续
+/// 全部偏移，必须先验定长。
+fn u32be(v: u64) -> Vec<u8> {
+    assert!(v < (1 << 32), "u32be 只编码 32 位以内值");
+    (v as u32).to_be_bytes().to_vec()
 }
 
 /// 元素 = ID 字节 + 尺寸 vint + 数据
@@ -68,19 +78,14 @@ struct ClusterSpec {
     subs: Vec<(i16, u64, String)>,
 }
 
-/// 组装一颗合成 MKV（EBML 头 + 已知尺寸 Segment + Info/Tracks/Clusters）
-fn build_mkv(sub_number: u64, codec: &str, private: &[u8], clusters: &[ClusterSpec]) -> Vec<u8> {
-    // Info（TimecodeScale = 1e6 → 1 单位 = 1ms）
+/// Info + Tracks（视频轨 1 + 目标字幕轨 sub_number）
+fn head_elements(sub_number: u64, codec: &str, private: &[u8]) -> Vec<u8> {
     let info = el_u(&[0x2a, 0xd7, 0xb1], 1_000_000);
-    // Tracks：视频轨(1) + 目标字幕轨
     let mut tracks = Vec::new();
     let mut video = Vec::new();
     video.extend(el_u(&[0xd7], 1));
     video.extend(el_u(&[0x83], 1));
     video.extend(el_s(&[0x86], "V_VP9"));
-    // Video 元素（PixelWidth/Height）：ffmpeg 的 matroska demuxer 对
-    // 视频轨硬性要求它存在，缺了 read_header 直接 Invalid data
-    // （ffprobe 7.1 实测；不加则引擎①的端到端测试无法跑）
     let mut ve = el_u(&[0xb0], 64);
     ve.extend(el_u(&[0xba], 64));
     video.extend(el(&[0xe0], &ve));
@@ -93,11 +98,26 @@ fn build_mkv(sub_number: u64, codec: &str, private: &[u8], clusters: &[ClusterSp
         sub.extend(el(&[0x63, 0xa2], private));
     }
     tracks.extend(el(&[0xae], &sub));
-    // Clusters：视频垃圾块（SimpleBlock，track 1）+ 字幕 BlockGroup + Void
-    let junk = vec![0xabu8; 128 * 1024];
-    let mut body = Vec::new();
-    body.extend(el(&[0x15, 0x49, 0xa9, 0x66], &info));
+    let mut body = el(&[0x15, 0x49, 0xa9, 0x66], &info);
     body.extend(el(&[0x16, 0x54, 0xae, 0x6b], &tracks));
+    body
+}
+
+/// EBML 头 + Segment(body) 外壳
+fn shell(body: &[u8]) -> Vec<u8> {
+    let mut eh = Vec::new();
+    eh.extend(el_s(&[0x42, 0x82], "matroska"));
+    eh.extend(el_u(&[0x42, 0xf2], 4));
+    eh.extend(el_u(&[0x42, 0xf3], 8));
+    let mut out = el(&[0x1a, 0x45, 0xdf, 0xa3], &eh);
+    out.extend(el(&[0x18, 0x53, 0x80, 0x67], body));
+    out
+}
+
+/// 组装一颗合成 MKV（无索引：引擎 ② 专用）
+fn build_mkv(sub_number: u64, codec: &str, private: &[u8], clusters: &[ClusterSpec]) -> Vec<u8> {
+    let junk = vec![0xabu8; 128 * 1024];
+    let mut body = head_elements(sub_number, codec, private);
     for c in clusters {
         let mut cl = Vec::new();
         cl.extend(el_u(&[0xe7], c.tc));
@@ -112,14 +132,67 @@ fn build_mkv(sub_number: u64, codec: &str, private: &[u8], clusters: &[ClusterSp
         cl.extend(el(&[0xec], &[0u8; 16])); // Void
         body.extend(el(&[0x1f, 0x43, 0xb6, 0x75], &cl));
     }
-    // EBML 头 + Segment
-    let mut eh = Vec::new();
-    eh.extend(el_s(&[0x42, 0x82], "matroska"));
-    eh.extend(el_u(&[0x42, 0xf2], 4));
-    eh.extend(el_u(&[0x42, 0xf3], 8));
-    let mut out = el(&[0x1a, 0x45, 0xdf, 0xa3], &eh);
-    out.extend(el(&[0x18, 0x53, 0x80, 0x67], &body));
-    out
+    shell(&body)
+}
+
+/// 组装「段内 SeekHead + 尾部 Cues」的合成 MKV（引擎 ① 会话路径用）。
+/// 每个字幕块一条 CuePoint（CueTime = 簇时码+块相对时码，含
+/// CueRelativePosition），与 MakeMKV / mkvmerge 的真实封装形态一致。
+fn build_mkv_indexed(sub_number: u64, codec: &str, private: &[u8], clusters: &[ClusterSpec]) -> Vec<u8> {
+    // 段内布局：[SeekHead][Info/Tracks][Clusters…][Cues]。
+    // SeekHead 指向 Cues，而 Cues 位置依赖 SeekHead 自身长度——
+    // SeekPosition 用定宽 4 字节 vint，长度与取值无关，可两步定长
+    let seekhead_probe = {
+        let mut sk = el(&[0x53, 0xab], &[0x1c, 0x53, 0xbb, 0x6b]); // SeekID = Cues
+        sk.extend(el(&[0x53, 0xac], &u32be(0)));
+        el(&[0x11, 0x4d, 0x9b, 0x74], &el(&[0x4d, 0xbb], &sk))
+    };
+    let base = seekhead_probe.len() as u64; // 后续元素在段数据区的基础偏移
+
+    let mut body = head_elements(sub_number, codec, private);
+    struct SubPos {
+        cue: u64,    // CueTime（TimecodeScale 单位）
+        cluster: u64, // Cluster 元素头相对段数据区
+        rel: u64,    // 块元素相对簇数据区
+    }
+    let mut positions: Vec<SubPos> = Vec::new();
+    let junk = vec![0xabu8; 64 * 1024];
+    for c in clusters {
+        let cluster_seg_off = base + body.len() as u64;
+        let mut cl = Vec::new();
+        cl.extend(el_u(&[0xe7], c.tc));
+        let mut sb = vs(1);
+        sb.extend(&0i16.to_be_bytes());
+        sb.push(0x80);
+        sb.extend(&junk);
+        cl.extend(el(&[0xa3], &sb));
+        for (rel, dur, text) in &c.subs {
+            positions.push(SubPos { cue: c.tc + *rel as u64, cluster: cluster_seg_off, rel: cl.len() as u64 });
+            cl.extend(block_group(sub_number, *rel, text.as_bytes(), *dur));
+        }
+        cl.extend(el(&[0xec], &[0u8; 16]));
+        body.extend(el(&[0x1f, 0x43, 0xb6, 0x75], &cl));
+    }
+    let cues_seg_off = base + body.len() as u64;
+    let mut cues = Vec::new();
+    for p in &positions {
+        let mut tp = el_u(&[0xf7], sub_number); // CueTrack
+        tp.extend(el_u(&[0xf1], p.cluster)); // CueClusterPosition
+        tp.extend(el_u(&[0xf0], p.rel)); // CueRelativePosition
+        let mut point = el_u(&[0xb3], p.cue); // CueTime
+        point.extend(el(&[0xb7], &tp)); // CueTrackPositions
+        cues.extend(el(&[0xbb], &point)); // CuePoint
+    }
+    body.extend(el(&[0x1c, 0x53, 0xbb, 0x6b], &cues));
+
+    let mut sk = el(&[0x53, 0xab], &[0x1c, 0x53, 0xbb, 0x6b]);
+    sk.extend(el(&[0x53, 0xac], &u32be(cues_seg_off)));
+    let seekhead = el(&[0x11, 0x4d, 0x9b, 0x74], &el(&[0x4d, 0xbb], &sk));
+    assert_eq!(seekhead.len(), seekhead_probe.len(), "定宽编码下 SeekHead 长度必须稳定");
+
+    let mut all = seekhead;
+    all.extend(body);
+    shell(&all)
 }
 
 /// 组装「未知尺寸 Segment」前缀（ffmpeg 8 字节 01+00…00 形态）：
@@ -154,7 +227,7 @@ fn write_tmp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
     p
 }
 
-/* ---------------- 原生引擎 ---------------- */
+/* ---------------- 引擎 ②：全量走读 ---------------- */
 
 #[test]
 fn native_srt_blocks() {
@@ -308,7 +381,7 @@ fn head_walk_resolves_track_table() {
     assert!(!out.metas[1].codec_private.is_empty());
 }
 
-/* ---------------- 大文件 / 巨块 seek ---------------- */
+/* ---------------- 大文件 / 巨块 seek（引擎 ②） ---------------- */
 
 #[test]
 fn native_sparse_4gb_seek() {
@@ -365,7 +438,7 @@ fn native_sparse_4gb_seek() {
         file_len = f.stream_position().unwrap();
     }
 
-    let t0 = Instant::now();
+    let t0 = std::time::Instant::now();
     let res = extract_native(&path.to_string_lossy(), 3, file_len).unwrap();
     let dt = t0.elapsed();
     let blocks = res.blocks.unwrap();
@@ -376,118 +449,135 @@ fn native_sparse_4gb_seek() {
     assert!(dt.as_secs() < 30, "稀疏 4GB 解析耗时异常：{dt:?}");
 }
 
-/* ---------------- ffmpeg 解析（跨平台探测） ---------------- */
+/* ---------------- 引擎 ①：索引会话（单套件串行，共享全局会话表） ---------------- */
 
+// 会话表是进程级全局：拆多个 #[test] 并行跑会互相逐出，故合成一个
+// 串行套件覆盖全部会话行为（子场景用块作用域隔离）。
 #[test]
-fn ffmpeg_names_match_platform() {
-    let names = ffmpeg_candidate_names();
-    // Windows 必须显式探测 .exe（winget / scoop / choco / 官方构建的
-    // 分发形态一律是 ffmpeg.exe）；其它平台是裸名 ffmpeg
-    if cfg!(windows) {
-        assert_eq!(names[0], "ffmpeg.exe", "Windows 首选 ffmpeg.exe");
-        assert!(names.contains(&"ffmpeg"), "无扩展名形态兜底");
-    } else {
-        assert_eq!(names, &["ffmpeg"]);
+fn session_engine_suite() {
+    let clusters = vec![
+        ClusterSpec { tc: 0, subs: vec![(0, 2500, "第一句".into()), (3000, 2000, "第二句".into())] },
+        ClusterSpec { tc: 60_000, subs: vec![(500, 4000, "一小时处的字幕".into())] },
+        ClusterSpec { tc: 120_000, subs: vec![(0, 1000, "两小时处".into())] },
+    ];
+
+    /* 窗口与全量逐块一致 + 边界互斥 + 空窗 */
+    {
+        let mkv = build_mkv_indexed(3, "S_TEXT/UTF8", &[], &clusters);
+        let p = write_tmp("session-parity", &mkv);
+        let path = p.to_string_lossy().to_string();
+        let file_len = mkv.len() as u64;
+
+        let info = session_open(&path, 3).unwrap();
+        assert_eq!(info.kind, "utf8");
+        assert_eq!(info.total_blocks, 4, "每个字幕块一条索引");
+        assert!(info.header.is_none());
+
+        // 引擎 ② 全量作对照
+        let full = extract_native(&path, 3, file_len).unwrap().blocks.unwrap();
+
+        // 全片两窗覆盖：[0, 90s) + [90s, 180s)，边界互斥不重不漏
+        let w1 = session_window(info.session_id, 0, 90_000).unwrap();
+        let w2 = session_window(info.session_id, 90_000, 180_000).unwrap();
+        assert_eq!((w1.skipped, w2.skipped), (0, 0));
+        assert_eq!(w1.blocks.len(), 3, "0ms / 3000ms / 60500ms 在窗 1");
+        assert_eq!(w2.blocks.len(), 1, "120000ms 在窗 2");
+        let mut merged = w1.blocks;
+        merged.extend(w2.blocks);
+        merged.sort_by_key(|b| b.time);
+        assert_eq!(merged, full, "窗口并集应与全量走读逐块一致");
+
+        // 对白之外的空窗：0 块、0 跳过
+        let w3 = session_window(info.session_id, 200_000, 300_000).unwrap();
+        assert_eq!((w3.blocks.len(), w3.skipped), (0, 0));
+
+        // seek 空洞：只看过 [0,10s) 后直接跳查 [100s,200s) 也能取到
+        let w4 = session_window(info.session_id, 0, 10_000).unwrap();
+        assert_eq!(w4.blocks.len(), 2);
+        let w5 = session_window(info.session_id, 100_000, 200_000).unwrap();
+        assert_eq!(w5.blocks.len(), 1, "120000ms 的块");
+        assert_eq!(w5.blocks[0].text, "两小时处");
+        session_close(info.session_id);
     }
-}
 
-#[test]
-fn path_parse_skips_empty_entries() {
-    // "a;;b" 形态含空项（shell 语义 = 当前目录），必须剔除：
-    // 一是行为确定（结果不随 CWD 漂移），二是防不受控目录里的同名文件
-    let raw = if cfg!(windows) {
-        OsStr::new("C:\\tools;;C:\\bin")
-    } else {
-        OsStr::new("/usr/bin::/opt/tools")
-    };
-    let dirs = dirs_from_path(raw);
-    assert_eq!(dirs.len(), 2, "空 PATH 项应被跳过：{dirs:?}");
-    assert!(dirs.iter().all(|d| !d.as_os_str().is_empty()));
-}
-
-#[test]
-#[cfg(unix)]
-fn candidate_needs_exec_bit() {
-    use std::os::unix::fs::PermissionsExt;
-    let d = std::env::temp_dir().join("jisu-kanpian-mkvsub-tests");
-    std::fs::create_dir_all(&d).unwrap();
-    let p = d.join("ffmpeg-execbit-probe");
-    std::fs::write(&p, b"#!sh\n").unwrap();
-    let set_mode = |mode: u32| {
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
-    };
-    set_mode(0o644); // 无任何可执行位
-    assert!(!is_runnable_candidate(&p), "无可执行位的文件不应成为候选");
-    set_mode(0o755);
-    assert!(is_runnable_candidate(&p), "带可执行位的普通文件应是候选");
-    let _ = std::fs::remove_file(&p);
-}
-
-#[test]
-fn resolved_exe_runs_and_matches_platform_name() {
-    if !ffmpeg_available() {
-        eprintln!("[skip] PATH 无 ffmpeg");
-        return;
-    }
-    let exe = ffmpeg_exe().expect("available 为真时必有解析结果");
-    // 解析出的路径必须能独立跑起来（不是只检查存在性）
-    assert!(probe_ffmpeg(exe), "解析出的路径必须可运行");
-    // 文件名符合平台约定（Windows 大小写不敏感 → 统一小写比较）
-    let name = exe.file_name().unwrap().to_string_lossy().to_lowercase();
-    if cfg!(windows) {
-        assert!(
-            name == "ffmpeg.exe" || name == "ffmpeg",
-            "Windows 候选文件名不符：{name}"
+    /* ASS 字段经窗口路径不丢（style/layer/margins/effect + 头） */
+    {
+        let mkv = build_mkv_indexed(
+            4,
+            "S_TEXT/ASS",
+            b"[Script Info]\nHDR-Q",
+            &[ClusterSpec {
+                tc: 1000,
+                subs: vec![(20, 3000, "7,0,StyleW,N,1,2,3,FX,窗口里的对白".into())],
+            }],
         );
-    } else {
-        assert_eq!(name, "ffmpeg");
+        let p = write_tmp("session-ass", &mkv);
+        let path = p.to_string_lossy().to_string();
+        let info = session_open(&path, 4).unwrap();
+        assert_eq!(info.kind, "ass");
+        assert_eq!(info.header.as_deref(), Some("[Script Info]\nHDR-Q"));
+        let w = session_window(info.session_id, 0, 60_000).unwrap();
+        assert_eq!(w.skipped, 0);
+        let b = &w.blocks[0];
+        assert_eq!((b.time, b.duration, b.text.as_str()), (1020, 3000, "窗口里的对白"));
+        assert_eq!((b.layer.as_str(), b.style.as_str(), b.name.as_str()), ("0", "StyleW", "N"));
+        assert_eq!(
+            (b.margin_l.as_str(), b.margin_r.as_str(), b.margin_v.as_str(), b.effect.as_str()),
+            ("1", "2", "3", "FX")
+        );
+        session_close(info.session_id);
     }
-    // 解析结果必须落在真实存在的目录里（非相对 CWD 的幽灵路径）
-    assert!(exe.parent().is_some_and(|d| d.is_dir()), "父目录应存在：{exe:?}");
-}
 
-/* ---------------- ffmpeg 引擎 / 降级 ---------------- */
-
-#[test]
-fn ffmpeg_engine_end_to_end() {
-    if !ffmpeg_available() {
-        eprintln!("[skip] PATH 无 ffmpeg，跳过 ffmpeg 引擎端到端");
-        return;
+    /* 无索引：引擎 ① 报降级标记，引擎 ② 全量仍可用 */
+    {
+        let mkv = build_mkv(3, "S_TEXT/UTF8", &[], &clusters); // 无 SeekHead / Cues
+        let p = write_tmp("session-noindex", &mkv);
+        let path = p.to_string_lossy().to_string();
+        let err = session_open(&path, 3).unwrap_err();
+        assert!(err.contains("Cues"), "应报索引缺失：{err}");
+        let res = extract_auto(&path, 3).unwrap(); // 降级路径
+        assert_eq!(res.method, "native");
+        assert_eq!(res.blocks.unwrap().len(), 4);
     }
-    let mkv = build_mkv(
-        3,
-        "S_TEXT/UTF8",
-        &[],
-        &[
-            ClusterSpec { tc: 0, subs: vec![(500, 2500, "Hello ffmpeg".into())] },
-            ClusterSpec { tc: 10_000, subs: vec![(0, 3000, "第二句 bye".into())] },
-        ],
-    );
-    let p = write_tmp("ffmpeg-e2e", &mkv);
-    let res = extract_auto(&p.to_string_lossy(), 3).unwrap();
-    assert_eq!(res.method, "ffmpeg", "有 ffmpeg 时应首选 ffmpeg");
-    let text = res.text.unwrap();
-    assert!(text.contains("Hello ffmpeg"), "ffmpeg 输出：{text}");
-    assert!(text.contains("第二句 bye"), "ffmpeg 输出：{text}");
-    assert!(text.contains("-->"), "SRT 应含时间轴：{text}");
-}
 
-#[test]
-fn ffmpeg_failure_falls_back_to_native() {
-    if !ffmpeg_available() {
-        eprintln!("[skip] PATH 无 ffmpeg");
-        return;
+    /* 定性错误文案与全量入口一致（前端按同套判据短路不走兜底） */
+    {
+        let mkv = build_mkv_indexed(3, "S_TEXT/UTF8", &[], &clusters);
+        let p = write_tmp("session-definite", &mkv);
+        let path = p.to_string_lossy().to_string();
+        let err = session_open(&path, 9).unwrap_err();
+        assert!(err.contains("找不到"), "实际：{err}");
+        let err = session_open(&path, 1).unwrap_err(); // 视频轨
+        assert!(err.contains("不是字幕轨"), "实际：{err}");
     }
-    let mkv = build_mkv(3, "S_TEXT/UTF8", &[], &[ClusterSpec {
-        tc: 0,
-        subs: vec![(100, 900, "fallback".into())],
-    }]);
-    let p = write_tmp("ffmpeg-fallback", &mkv);
-    // 越界字幕轨序号：ffmpeg 报错 → 原生引擎（按 TrackNumber）成功接手
-    let bad = extract_ffmpeg(&p.to_string_lossy(), 9, "srt", mkv.len() as u64);
-    assert!(bad.is_err());
-    let res = extract_native(&p.to_string_lossy(), 3, mkv.len() as u64).unwrap();
-    assert_eq!(res.blocks.unwrap()[0].text, "fallback");
+    {
+        let mkv = build_mkv_indexed(3, "S_HDMV/PGS", &[], &[ClusterSpec { tc: 0, subs: vec![(0, 100, "x".into())] }]);
+        let p = write_tmp("session-pgs", &mkv);
+        let err = session_open(&p.to_string_lossy(), 3).unwrap_err();
+        assert!(err.contains("未适配") || err.contains("图形"), "实际：{err}");
+    }
+
+    /* 会话失效（不存在 / 已关闭 / 被逐出） */
+    {
+        let err = session_window(999_999, 0, 1000).unwrap_err();
+        assert!(err.contains("失效"), "实际：{err}");
+
+        let mkv = build_mkv_indexed(3, "S_TEXT/UTF8", &[], &clusters);
+        let p = write_tmp("session-evict", &mkv);
+        let path = p.to_string_lossy().to_string();
+        let ids: Vec<u64> = (0..SESSION_CAP as u64 + 2)
+            .map(|_| session_open(&path, 3).unwrap().session_id) // 逐个打开
+            .collect();
+        // 全部打开后：最旧的（ids 首个）应已被逐出
+        let err = session_window(ids[0], 0, 200_000).unwrap_err();
+        assert!(err.contains("失效"), "最旧会话应被逐出：{err}");
+        // 最新的仍可用
+        let w = session_window(*ids.last().unwrap(), 0, 200_000).unwrap();
+        assert_eq!(w.blocks.len(), 4);
+        for id in &ids[1..] {
+            session_close(*id);
+        }
+    }
 }
 
 /* ---------------- 真实媒体对照（可选） ---------------- */
@@ -517,10 +607,26 @@ fn real_media_parity() {
     assert!(blocks[0].text.contains("内嵌ASS字幕"));
     assert_eq!(blocks[0].style, "Default");
 
-    // 有 ffmpeg 时三级链路也应全通
-    if ffmpeg_available() {
-        let r = extract_auto(&path, srt.number).unwrap();
-        let cues = r.text.unwrap().matches("-->").count();
-        assert_eq!(cues, 6, "ffmpeg SRT 输出应含 6 条时间轴");
+    // 全量入口（引擎 ②）可走通
+    let r = extract_auto(&path, srt.number).unwrap();
+    assert_eq!(r.method, "native");
+
+    // 有索引时：全片窗口扫的并集应与全量逐块一致
+    if let Ok(info) = session_open(&path, srt.number) {
+        let full = extract_native(&path, srt.number, file_len).unwrap().blocks.unwrap();
+        let max_t = full.last().map(|b| b.time).unwrap_or(0) + 1;
+        let mut merged = Vec::new();
+        let mut from = 0u64;
+        while from <= max_t {
+            let w = session_window(info.session_id, from, from + 60_000).unwrap();
+            assert_eq!(w.skipped, 0, "索引条目应全部命中");
+            merged.extend(w.blocks);
+            from += 60_000;
+        }
+        merged.sort_by_key(|b| b.time);
+        assert_eq!(merged, full, "窗口并集 == 全量");
+        session_close(info.session_id);
+    } else {
+        eprintln!("[info] multi.mkv 无可用索引，跳过会话对照");
     }
 }

@@ -15,14 +15,15 @@
    *      SourceBuffer，不支持的编码在菜单里置灰），否则原生 <video>；
    *    - mkv / webm：手写 EBML 轨道分析器列出音轨与字幕轨（原生
    *      播放，音轨无法切换——Chromium 原生限制；内嵌 SRT/ASS 字幕
-   *      按 read_range 流式喂 matroska-subtitles 提取为 WebVTT 挂载，
-   *      内存恒定、无文件大小限制，提取中显示进度并可被取消）；
+   *      走后端三级引擎：Cues 索引会话窗口化取块（首窗亚秒、播放中
+   *      按需补窗、seek 即查即得）→ 原生全量走读（无索引兜底，带
+   *      进度）→ JS 流式兜底，统一转 WebVTT 挂载）；
    *    - m3u8：hls.js（WebView 原生支持 HLS 时优先原生）；
    *    - 其余：原生 <video>（asset 协议直读本地文件）；
    * 3. 字幕统一 WebVTT：外挂 .vtt 直挂 <track>，.srt 转换后挂载，
    *    .ass/.ssa 由 ass-compiler 解析为富文本（<i>/<b>/<u>）后挂载；
    *    MP4 内嵌 wvtt / tx3g 由 mp4box 抽样提取；MKV 内嵌 SRT / ASS
-   *    由 matroska-subtitles 提取（ASS 同样走 ass-compiler）；
+   *    走后端索引会话 / 全量走读（ASS 同样经 ass-compiler）；
    *    hls.js 的字幕轨走其自带 textTracks；图形字幕（PGS/VOBSub）
    *    在菜单中置灰并说明；
    * 4. 画面支持旋转（顺时针 90° 步进）与放大缩小（1×~5×），
@@ -62,7 +63,7 @@
   import { analyzeMp4 } from './lib/mp4/analyzer.js';
   import { MseEngine, isAudioCodecSupported } from './lib/mp4/mse-engine.js';
   import { analyzeMkv } from './lib/mkv/tracks.js';
-  import { extractMkvSubtitles } from './lib/mkv/subtitles.js';
+  import { extractMkvSubtitles, openMkvSubtitleSession, MkvSessionSubtitlePlayer } from './lib/mkv/subtitles.js';
   import { assToCues } from './lib/mkv/ass.js';
   import {
     SubtitleManager,
@@ -133,6 +134,7 @@
   let unlistenClose = null;
   let subManager = null;  // 字幕控制器（挂 <track> 用）
   let subExtractGen = 0;  // 内嵌字幕提取代次（再次选择 / 换文件时作废进行中的提取）
+  let subSessionPlayer = null; // 索引会话播放器（引擎 ①：窗口化取 MKV 内嵌字幕）
 
   /* ---------- 媒体管线状态 ---------- */
   let mediaInfo = null;   // analyzeMp4 结果（或 null）
@@ -259,6 +261,10 @@
   function teardownMedia() {
     mseLoading = false;
     subExtractGen++; // 作废进行中的流式字幕提取（MKV 大文件提取耗时可观）
+    if (subSessionPlayer) { // 索引会话：关闭后端会话并停掉窗口预取
+      subSessionPlayer.destroy();
+      subSessionPlayer = null;
+    }
     if (engine) {
       engine.destroy();
       engine = null;
@@ -694,6 +700,10 @@
     if (opt.disabled) return; // 图形字幕等：置灰项（菜单层已拦截，双保险）
     subValue = key;
     const label = opt.label || '';
+    if (subSessionPlayer) { // 切换任何字幕源前：关掉旧索引会话
+      subSessionPlayer.destroy();
+      subSessionPlayer = null;
+    }
     if (key === 'off') {
       if (mediaMode === 'hls' && hls) {
         try { hls.subtitleTrack = -1; } catch { /* 忽略 */ }
@@ -742,47 +752,91 @@
       return;
     }
     if (key.startsWith('mkvsub:')) {
-      // MKV 内嵌字幕：read_range 流式喂入 matroska-subtitles 提取目标轨
-      // （内存恒定，任意大小文件可提取；耗时只受磁盘顺序读速度限制）
+      // MKV 内嵌字幕（v1.0.7 三级引擎）：
+      // ① 索引会话（Cues 跳跃）：首窗亚秒挂载，播放中窗口化补取；
+      // ② 原生全量走读（无索引 / 会话失败时的兜底，进度百分比）；
+      // ③ JS 流式兜底（lib/mkv/subtitles.js 调度）
       const num = Number(key.slice(7));
       const tr = mediaInfo ? mediaInfo.subtitleTracks.find((t) => t.id === num) : null;
       if (!tr || !currentVideoPath) {
         subValue = 'off';
         return;
       }
-      const size = Number(await invoke('stat_file', { path: currentVideoPath })) || 0;
       const gen = ++subExtractGen; // 提取代次：换字幕 / 换文件 / teardown 时作废
       let pctShown = -1;
-      setStatus('正在提取内嵌字幕…');
-      try {
-        // v1.0.5 三级引擎：后端 ffmpeg → 原生 EBML → JS 流式兜底
-        // （lib/mkv/subtitles.js 调度；进度 method 见 onProgress 第三参）
+      const lang = normLang(tr.lang);
+      const finish = () => {
+        subLangPref = lang || subLangPref;
+        scheduleSave();
+        setStatus(`字幕：${label}`);
+      };
+      const failOutright = (e) => {
+        if (gen !== subExtractGen) return false;
+        setStatus(e && e.message ? `内嵌字幕提取失败：${e.message}` : '内嵌字幕提取失败');
+        subValue = 'off';
+        return true;
+      };
+      /** ②③ 全量降级（无索引 / 会话中途失败时；返回是否成功挂载） */
+      const fallbackToFull = async () => {
+        const size = Number(await invoke('stat_file', { path: currentVideoPath })) || 0;
+        setStatus('正在提取内嵌字幕（原生引擎）…');
         const cues = await extractMkvSubtitles(currentVideoPath, size, num, tr, {
-          onProgress: (bytes, total, method) => {
+          onProgress: (bytes, total) => {
             if (gen !== subExtractGen) return;
-            if (method === 'ffmpeg') {
-              // ffmpeg demux 无内部进度：展示引擎名（秒级完成）
-              setStatus('正在提取内嵌字幕（ffmpeg 引擎）…');
-              return;
-            }
             const pct = total > 0 ? Math.min(100, Math.floor((bytes / total) * 100)) : 100;
             if (pct !== pctShown) {
               pctShown = pct;
-              setStatus(`正在提取内嵌字幕${method === 'native' ? '（原生引擎）' : ''}… ${pct}%`);
+              setStatus(`正在提取内嵌字幕（原生引擎）… ${pct}%`);
             }
           },
           shouldAbort: () => gen !== subExtractGen
         });
-        if (gen !== subExtractGen || !cues) return; // 已被新的选择 / 文件取代
-        const vttText = cuesToVtt(cues);
-        await subManager.attach({ vttText, lang: normLang(tr.lang), label });
-        subLangPref = normLang(tr.lang) || subLangPref;
-        scheduleSave();
-        setStatus(`字幕：${label}`);
+        if (gen !== subExtractGen || !cues) return false; // 被新选择 / 新文件取代
+        await subManager.attach({ vttText: cuesToVtt(cues), lang, label });
+        return true;
+      };
+      setStatus('正在加载内嵌字幕…');
+      try {
+        // ① 索引会话（无索引返回 null → ②③；定性错误直接抛）
+        const session = await openMkvSubtitleSession(currentVideoPath, num, tr);
+        if (gen !== subExtractGen) return;
+        if (session) {
+          const player = new MkvSessionSubtitlePlayer(session, videoEl, subManager, {
+            lang,
+            label,
+            cuesToVtt,
+            onFail: async () => {
+              // 窗口失败（索引不完整 / 会话失效 / IO）：一次性降级 ②③
+              if (gen !== subExtractGen) return;
+              if (subSessionPlayer === player) {
+                player.destroy();
+                subSessionPlayer = null;
+              }
+              try {
+                if (await fallbackToFull()) finish();
+                else failOutright(null);
+              } catch (e) {
+                failOutright(e);
+              }
+            }
+          });
+          subSessionPlayer = player;
+          await player.start();
+          if (player.failed || player.destroyed || gen !== subExtractGen) return; // onFail 已接管
+          finish();
+          if (typeof window !== 'undefined') window.__kpExtractMethod = 'session'; // 测试钩子
+          return;
+        }
+        // ②③ 全量
+        if (await fallbackToFull()) {
+          finish();
+          if (typeof window !== 'undefined') window.__kpExtractMethod = 'native';
+        } else if (gen === subExtractGen && subValue !== 'off') {
+          subValue = 'off'; // 全量被取代以外的原因落空（如静默取消）
+        }
       } catch (e) {
         if (gen !== subExtractGen) return;
-        setStatus(e && e.message ? `内嵌字幕提取失败：${e.message}` : '内嵌字幕提取失败');
-        subValue = 'off';
+        failOutright(e);
       }
       return;
     }
@@ -1379,7 +1433,12 @@
       const t = videoEl.currentTime;
       if (Math.abs(t - curTime) > 0.05) curTime = t;
       if (engine) engine.tick(); // 分段节流恢复
+      if (subSessionPlayer) subSessionPlayer.tick(); // 字幕索引会话：按需补窗
       scheduleSave();
+    });
+    videoEl.addEventListener('seeked', () => {
+      // 索引会话字幕：seek 落到未覆盖区间时即查新窗（前进 / 倒退都行）
+      if (subSessionPlayer) subSessionPlayer.onSeek();
     });
     videoEl.addEventListener('play', () => {
       playing = true;
