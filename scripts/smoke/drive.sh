@@ -88,21 +88,28 @@ agent-browser wait 400 >/dev/null 2>&1
 agent-browser eval "document.querySelector('button[aria-label=选择字幕]').click();1" >/dev/null
 agent-browser wait 400 >/dev/null 2>&1
 ck "MKV 字幕菜单 6 项（内嵌×2 + 外挂×3 + 不启用）" "$(j "document.querySelectorAll('.menu-item').length")" "6"
-# v1.0.4：内嵌字幕提取已流式化（read_range 分块喂入）。压到 16KB/块，
-# 1.59MB 的 multi.mkv 要跨约 98 块——验证 EBML 元素跨块边界的解析正确性
+# v1.0.5 三级引擎 · 内嵌 srt 走后端快速路径（mock 模拟 ffmpeg 引擎：
+# 完整 SRT 文档直返 + 600ms 延迟让进度轮询可观察，零 read_range 分块）
+FAST_BEFORE=$(j "window.__invokeLog().filter(c=>c==='read_range').length")
+agent-browser eval "(()=>{const it=[...document.querySelectorAll('.menu-item')];it.find(i=>i.textContent.includes('内嵌 srt')).click();return 1})()" >/dev/null
+agent-browser wait 1600 >/dev/null 2>&1
+ck "MKV 内嵌 SRT 快速路径命中（引擎=ffmpeg）" "$(j "window.__kpExtractMethod||'none'")" "ffmpeg"
+ck "MKV 内嵌 SRT 快速路径（cue 数 = 6）" "$(j "(document.querySelector('video').querySelector('track')||{}).track?.cues?.length || 0")" "6"
+ck "快速路径零 read_range 分块读（不再流式过全文件）" "$(j "(()=>{const d=window.__invokeLog().filter(c=>c==='read_range').length-$FAST_BEFORE;return d===0?'zero:'+d:'leak:'+d})()")" "zero:"
+ck "快速路径进度轮询已触发（query_extract_progress）" "$(j "window.__invokeLog().includes('query_extract_progress')")" "true"
+ck "快速路径首条 cue 文本正确" "$(j "document.querySelector('video').querySelector('track').track.cues[0].text")" "欢迎观看极速看片"
+# 后选 ASS（chi）：mock 后端双引擎失败 → 回退 ③ JS 流式（v1.0.4 兼容
+# 路径）；压 16KB 小块——ASS 头(CodecPrivate)跨块 + 块重组覆盖；
+# 最终语言偏好回到 zh（影响下一文件的默认字幕）
 RR_BEFORE=$(j "window.__invokeLog().filter(c=>c==='read_range').length")
 agent-browser eval "window.__kpMkvChunkBytes=16384;1" >/dev/null
-agent-browser eval "(()=>{const it=[...document.querySelectorAll('.menu-item')];it.find(i=>i.textContent.includes('内嵌 srt')).click();return 1})()" >/dev/null
-agent-browser wait 2500 >/dev/null 2>&1
-ck "MKV 内嵌 SRT 流式提取（cue 数 = 6）" "$(j "(document.querySelector('video').querySelector('track')||{}).track?.cues?.length || 0")" "6"
-ck "MKV 流式提取真实走 read_range 分块（≥90 块）" "$(j "(()=>{const d=window.__invokeLog().filter(c=>c==='read_range').length-$RR_BEFORE;return d>=90?'chunked:'+d:'too-few:'+d})()")" "chunked:"
-# 后选 ASS（chi）：最终语言偏好回到 zh（影响下一文件的默认字幕）；
-# 同样保持 16KB 小块——ASS 头(CodecPrivate)跨块 + 块重组的覆盖
 agent-browser eval "document.querySelector('button[aria-label=选择字幕]').click();1" >/dev/null
 agent-browser wait 400 >/dev/null 2>&1
 agent-browser eval "(()=>{const it=[...document.querySelectorAll('.menu-item')];it.find(i=>i.textContent.includes('内嵌 ass')).click();return 1})()" >/dev/null
 agent-browser wait 3000 >/dev/null 2>&1
-ck "MKV 内嵌 ASS 流式提取（cue 数 = 4）" "$(j "(document.querySelector('video').querySelector('track')||{}).track?.cues?.length || 0")" "4"
+ck "MKV 内嵌 ASS 后端失败回退 JS 流式（引擎=js）" "$(j "window.__kpExtractMethod||'none'")" "js"
+ck "MKV ASS 流式提取（cue 数 = 4）" "$(j "(document.querySelector('video').querySelector('track')||{}).track?.cues?.length || 0")" "4"
+ck "MKV ASS 回退真实走 read_range 分块（≥90 块）" "$(j "(()=>{const d=window.__invokeLog().filter(c=>c==='read_range').length-$RR_BEFORE;return d>=90?'chunked:'+d:'too-few:'+d})()")" "chunked:"
 ck "MKV ASS 富文本（斜体标签进 cue）" "$(j "(document.querySelector('video').querySelector('track').track.cues[0].text.includes('<i>')) + ''")" "true"
 agent-browser eval "window.__kpMkvChunkBytes=0;1" >/dev/null
 agent-browser screenshot "$SHOTS/smoke-mkv-subs.png" >/dev/null 2>&1

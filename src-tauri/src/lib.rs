@@ -1,4 +1,5 @@
 mod commands;
+mod mkvsub;
 mod power;
 mod scanner;
 mod state;
@@ -20,6 +21,8 @@ pub fn run() {
             commands::scan_directory,
             commands::read_range,
             commands::stat_file,
+            commands::extract_mkv_subtitles,
+            commands::query_extract_progress,
             commands::load_state,
             commands::save_state,
             commands::set_keep_awake,

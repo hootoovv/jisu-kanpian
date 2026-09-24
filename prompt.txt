@@ -81,6 +81,64 @@ F1：显示所有快捷键
 
 ## 修订记录
 
+### v1.0.6（2026-09-24）
+
+1. 优化：ffmpeg 探测跨平台兼容（Windows 平台 ffmpeg 的可执行文件是
+   ffmpeg.exe，带扩展名分发）。弃用 `Command::new("ffmpeg")` 的按名搜索
+   （Windows 上 CreateProcess 的搜索序含 CWD、对 .exe / .bat 的解析
+   不可控），改为显式解析绝对路径并缓存（mkvsub.rs 的 ffmpeg_exe）：
+   - 候选目录：Windows 先查应用 exe 同目录——便携部署（把 ffmpeg.exe
+     放在播放器旁边）免配 PATH 即可被找到，再查 PATH 各项；其它平台
+     只查 PATH；
+   - 候选文件名：Windows 显式 `ffmpeg.exe`（NTFS 大小写不敏感，
+     FFMPEG.EXE 等变体天然命中；无扩展名形态兜底），其它平台
+     `ffmpeg`（要求可执行位）；
+   - 逐候选 `-version` 验证可运行性：Windows 应用执行别名
+     （WindowsApps 下的零字节残影 stub）文件存在却无法启动，验证可
+     自动跳过坏别名，不挡 PATH 里靠后的真 ffmpeg；
+   - 空 PATH 项（shell 语义 = 当前目录）剔除，不搜 CWD；
+   - 解析结果 OnceLock 缓存一次，后续 extract_ffmpeg 直接以该绝对路径
+     作为程序路径调用（不再依赖 CreateProcess / posix_spawn 按名搜索）；
+   - 探测发生在 spawn_blocking 提取线程内首次触发，不卡 UI；Windows
+     下探测与提取全程 CREATE_NO_WINDOW 防控制台黑窗闪现；
+2. 单元测试新增 4 项：候选文件名平台匹配（Windows 首选 ffmpeg.exe）、
+   PATH 空项剔除、Unix 可执行位要求、解析结果可运行性与平台命名校验
+   （沙箱实有 ffmpeg 7.1，端到端真实跑通）；
+3. 顺带修正：src-tauri/Cargo.lock 的包版本自 v1.0.2 起未随版本号同步
+   （不影响构建，本次对齐）；文档四件套同步（README 版本亮点与 FAQ、
+   使用说明 §6 故障排查、架构设计 §3.6 新增「ffmpeg 探测」专段）。
+
+### v1.0.5（2026-09-24）
+
+1. 优化：大文件 MKV 内嵌字幕提取速度（v1.0.4 流式化解决了「文件过大被
+   拒」，但 5GB 级文件要把全部字节经 IPC 传进 WebView 再用 JS 单线程解析，
+   耗时分钟级）；改为三级引擎降级，字幕提取整体下沉到 Rust 侧：
+   - 引擎① ffmpeg：启动后探测 PATH（缓存结果），存在则
+     `ffmpeg -i <file> -map 0:s:<n> -c:s copy -f srt/ass/webvtt pipe:1`
+     纯 demux + copy 直写 stdout（无转码、无临时文件），5GB 文件秒级完成，
+     输出即完整字幕文档；Windows 下 CREATE_NO_WINDOW 防控制台黑窗闪现；
+   - 引擎② 原生 EBML：机器无 ffmpeg（或 ffmpeg 失败）时，后端手写流式
+     EBML 走读顺序扫 Cluster，视频/音频块用 seek 直接跳过，只有目标轨
+     字幕块进内存——解析在原生代码完成，速度只受磁盘顺序读限制，比
+     「IPC 传全文件 + JS 解析」快 1~2 个数量级；语义与 matroska-subtitles
+     完全对齐（字幕事件只来自 BlockGroup→Block，时间 = Cluster 时码 +
+     Block 相对时码 × TimecodeScale，ASS/SSA 的 Dialogue 字段拆分同款）；
+   - 引擎③ JS 流式兜底：①② 都失败（罕见的 lacing 分帧 / 容器损伤 /
+     旧版本后端）时，前端回退 v1.0.4 的 matroska-subtitles 流式路径；
+   - 降级判据：后端报「定性错误」（轨道不存在 / 不是字幕轨 / 格式未
+     适配 / 无内容 / 空文件）直接抛出不走兜底——JS 路径必撞同墙，白扫
+     5GB 只会浪费时间；容器级错误才值得花时间走③；
+2. 新增后端模块 src-tauri/src/mkvsub.rs（~790 行，零新增依赖）+ 命令
+   extract_mkv_subtitles（spawn_blocking 后台线程执行）与
+   query_extract_progress（进度轮询：原生引擎按文件偏移出百分比，ffmpeg
+   无内部进度展示引擎名）；前端 lib/mkv/subtitles.js 重构为三级调度 +
+   ffmpeg 文档输出（SRT/WebVTT/ASS 全文）的轻量转换器；
+3. 验证：Rust 侧 12 项单测全过（合成 MKV 驱动：SRT/ASS/SSA 字段拆分、
+   双字节 TrackNumber、未知尺寸 Segment、4GB 巨型视频块 seek 跳过、
+   ffmpeg 端到端与降级链路、真实媒体 multi.mkv 对照）；前端冒烟 85/85
+   两遍全绿（新增：快速路径引擎命中、零分块读、进度轮询触发、兜底回退
+   引擎=js 共 5 项断言）。
+
 ### v1.0.4（2026-09-24）
 
 1. 修复：大文件 MKV（如 5GB）选择内嵌字幕提示「文件过大，暂不支持提取内嵌

@@ -1,14 +1,16 @@
 //! Tauri 命令：前端通过 invoke(...) 调用的后端接口。
 //!
-//! | 命令            | 作用                                             |
-//! |-----------------|--------------------------------------------------|
-//! | scan_directory  | 递归扫描目录（自然排序），返回有序结构           |
-//! | read_range      | 按区间读取文件字节（mp4box.js 分析 moov 用）     |
-//! | stat_file       | 读取文件总大小（moov 尾部定位用）                |
-//! | load_state      | 读取上次的观看位置与播放偏好                     |
-//! | save_state      | 保存当前观看位置与各项偏好                       |
-//! | set_keep_awake  | 播放期间阻止屏保 / 休眠（Wake Lock 不可用时兜底）|
-//! | exit_app        | 退出程序（兜底用，正常走窗口 destroy）           |
+//! | 命令                    | 作用                                             |
+//! |-------------------------|--------------------------------------------------|
+//! | scan_directory          | 递归扫描目录（自然排序），返回有序结构           |
+//! | read_range              | 按区间读取文件字节（mp4box.js 分析 moov 用）     |
+//! | stat_file               | 读取文件总大小（moov 尾部定位用）                |
+//! | extract_mkv_subtitles   | MKV 内嵌字幕提取（ffmpeg → 原生 EBML 双引擎）    |
+//! | query_extract_progress  | 提取进度轮询（前端 await 期间展示百分比）         |
+//! | load_state              | 读取上次的观看位置与播放偏好                     |
+//! | save_state              | 保存当前观看位置与各项偏好                       |
+//! | set_keep_awake          | 播放期间阻止屏保 / 休眠（Wake Lock 不可用时兜底）|
+//! | exit_app                | 退出程序（兜底用，正常走窗口 destroy）           |
 //!
 //! 播放本身不占命令位：前端 <video> 元素通过 asset 协议直接读取
 //! 本地文件，seek / 音量 / 暂停全部由 WebView 原生完成，不走 IPC。
@@ -61,6 +63,30 @@ pub fn read_range(path: String, offset: u64, length: u64) -> Result<tauri::ipc::
     file.read_exact(&mut buf)
         .map_err(|e| format!("读取文件内容失败：{e}"))?;
     Ok(tauri::ipc::Response::new(buf))
+}
+
+/// 提取 MKV 内嵌字幕轨（v1.0.5 三级引擎的前两级：ffmpeg 优先、
+/// 原生 EBML 兜底；均失败时前端回退 JS 流式兼容路径）。
+/// 解析在阻塞线程池执行；进度经 query_extract_progress 轮询。
+#[tauri::command]
+pub async fn extract_mkv_subtitles(
+    path: String,
+    track_number: u64,
+) -> Result<crate::mkvsub::ExtractResult, String> {
+    crate::mkvsub::progress_begin();
+    let out = tauri::async_runtime::spawn_blocking(move || {
+        crate::mkvsub::extract_auto(&path, track_number)
+    })
+    .await
+    .map_err(|e| format!("提取任务执行失败：{e}"));
+    crate::mkvsub::progress_end();
+    out?
+}
+
+/// 查询内嵌字幕提取进度（extract_mkv_subtitles 运行期间由前端轮询）
+#[tauri::command]
+pub fn query_extract_progress() -> crate::mkvsub::ProgressSnapshot {
+    crate::mkvsub::progress_snapshot()
 }
 
 /// 读取上次会话状态

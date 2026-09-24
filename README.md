@@ -3,6 +3,10 @@
 > 基于 **Rust + Tauri 2.0 + Svelte 5 + Vite** 的桌面视频播放器
 > 拖入目录即看 · 黑色影院舞台 · 字母顺序递归连看 · 多音轨 / 内嵌 + 外挂字幕 · 画面旋转缩放 · 全键盘操作 · 每文件断点续看
 >
+> v1.0.6：ffmpeg 探测跨平台兼容（Windows 显式找 PATH / 应用同目录下的 ffmpeg.exe，逐候选 -version 验证，坏应用别名自动跳过；便携部署可用）
+>
+> v1.0.5：MKV 内嵌字幕三级引擎（PATH 有 ffmpeg 秒级提取 → Rust 原生 EBML 流式 → JS 兜底），大文件提取从分钟级降到秒级
+>
 > v1.0.4：MKV 内嵌字幕流式提取（read_range 分块喂入，内存恒定、无文件大小限制，带进度与取消）
 >
 > v1.0.3：音轨切换修复（异编码整 MediaSource 重建）· MKV/WebM 轨道分析与内嵌 SRT/ASS 字幕提取 · 外挂 .ass/.ssa · 不支持编码菜单置灰
@@ -17,11 +21,11 @@
 
 | 层 | 技术 |
 |---|---|
-| 后端 | Rust 1.77+，Tauri 2（`tauri-plugin-dialog` 系统目录选择；`read_range` 按区间吐字节，供前端做 moov 分析与 MKV 内嵌字幕流式提取） |
-| 前端 | Svelte 5（runes），Vite 6，原生 `<video>`（asset 协议直读本地文件），mp4box.js（轨道分析 + MSE 多音轨分段），hls.js（m3u8，按需动态加载），matroska-subtitles（MKV 字幕提取，浏览器 bundle 按需加载），ass-compiler（ASS/SSA 解析），WebVTT（字幕统一出口） |
+| 后端 | Rust 1.77+，Tauri 2（`tauri-plugin-dialog` 系统目录选择；`read_range` 按区间吐字节供 moov / 轨道表分析；`mkvsub.rs` 内嵌字幕三级引擎：ffmpeg 子进程 → 原生 EBML 走读，带进度轮询） |
+| 前端 | Svelte 5（runes），Vite 6，原生 `<video>`（asset 协议直读本地文件），mp4box.js（轨道分析 + MSE 多音轨分段），hls.js（m3u8，按需动态加载），matroska-subtitles（MKV 字幕提取第三级兜底，浏览器 bundle 按需加载），ass-compiler（ASS/SSA 解析），WebVTT（字幕统一出口） |
 | 通信 | Tauri IPC 命令 + asset 协议（本地媒体零拷贝直读） |
 
-本仓库已在 **Debian 13 + Node 24** 环境验证：`npm run build`（前端，149 模块零警告）；另以 **mock Tauri API 的无头浏览器冒烟测试**（Chromium）加载真实构建产物，用 ffmpeg 生成的**真实多音轨 MP4（中/英/日 + 内嵌 mov_text 字幕）、双编码 MP4（AAC/Opus/AC-3）、多轨 MKV（AAC/MP3 + 内嵌 ASS/SRT 字幕）、WebM、本地 HLS 流与外挂 vtt/srt/ass** 完整走会话恢复、HLS 播放、快进快退与自动连播、MKV 轨道分析与内嵌字幕提取（含 ASS 富文本与分块流式边界覆盖）、MSE 多音轨装载与切换（同编码无感 + 异编码重建）、不支持编码菜单置灰、内嵌 / 外挂字幕挂载、旋转缩放、放大拖拽、逐帧步进、各浮层开关、音量键盘 / 滚轮、状态存档字段、断点精确恢复（RAP + 缓冲就绪精调）与 `X` 键清记忆，**80/80 断言通过（两遍回归），全程零运行时错误**。Rust 纯逻辑模块（scanner / state）在沙箱以真实 cargo 编译并跑过全部单元测试；commands / lib 的 tauri API 已逐一比对官方源码签名（沙箱无 webkit/gtk 系统库，完整 cargo check 请在目标平台执行）。
+本仓库已在 **Debian 13 + Node 24** 环境验证：`npm run build`（前端，149 模块零警告）；另以 **mock Tauri API 的无头浏览器冒烟测试**（Chromium）加载真实构建产物，用 ffmpeg 生成的**真实多音轨 MP4（中/英/日 + 内嵌 mov_text 字幕）、双编码 MP4（AAC/Opus/AC-3）、多轨 MKV（AAC/MP3 + 内嵌 ASS/SRT 字幕）、WebM、本地 HLS 流与外挂 vtt/srt/ass** 完整走会话恢复、HLS 播放、快进快退与自动连播、MKV 轨道分析与内嵌字幕提取（含 ASS 富文本、三级引擎快速路径命中与后端失败回退 JS 流式的完整降级链）、MSE 多音轨装载与切换（同编码无感 + 异编码重建）、不支持编码菜单置灰、内嵌 / 外挂字幕挂载、旋转缩放、放大拖拽、逐帧步进、各浮层开关、音量键盘 / 滚轮、状态存档字段、断点精确恢复（RAP + 缓冲就绪精调）与 `X` 键清记忆，**85/85 断言通过（两遍回归），全程零运行时错误**。Rust 纯逻辑模块（scanner / state / **mkvsub 三级引擎：含 ffmpeg 端到端、降级链路与真实媒体对照其 12 项单测**）在沙箱以真实 cargo 编译并跑过全部单元测试；commands / lib 的 tauri API 已逐一比对官方源码签名（沙箱无 webkit/gtk 系统库，完整 cargo check 请在目标平台执行）。
 
 ---
 
@@ -32,7 +36,7 @@
 - **一键关目录**：`X` 键关闭当前目录回到引导页，同时清除该目录的位置记忆（下次启动不再自动恢复）
 - **递归有序连看**：按字母顺序递归遍历所有子目录（自然排序：`ep2.mp4` 排在 `ep10.mp4` 之前），列表顺序连播，播完最后一个文件即停
 - **多音轨**（mp4box.js + MSE）：MP4 里的全部音轨（语言标签 + 声道数）进弹出式菜单；**默认选中界面语言**（中文），且只在 MSE 支持的编码里挑；**同编码切换无感**（视频画面不中断）；**异编码切换**（AAC ⇄ Opus 等）自动重建 MediaSource 后原位恢复；WebView 不支持的编码（如 AC-3）在菜单里**置灰并标注原因**；单音轨文件自动禁用菜单；MSE 完全不可用时回退原生播放并在菜单里说明。MKV / WebM 的音轨同样列出（含编码标签），但原生播放无法切换（Chromium 限制，选择时提示）
-- **字幕**（统一 WebVTT）：弹出式菜单含「不启用」（默认：匹配界面语言的轨，没有匹配则不启用）；支持 MP4 内嵌字幕（wvtt / tx3g 抽样提取转 VTT）、**MKV 内嵌字幕（SRT / ASS，read_range 分块流式提取——内存恒定与文件大小无关、任意大 MKV 可用，提取中状态栏显示百分比、可随时切走取消；ASS 经 ass-compiler 解析为斜体 / 粗体富文本）**、外挂同名 `.vtt` 直挂、外挂 `.srt` 自动转 VTT、**外挂 `.ass` / `.ssa` 富文本解析**（`电影.zh.srt` 之类的语言后缀会进菜单标签）；图形字幕（PGS / VOBSub）在菜单中置灰说明；没有字幕流时按钮禁用；HLS 字幕轨由 hls.js 自带渲染
+- **字幕**（统一 WebVTT）：弹出式菜单含「不启用」（默认：匹配界面语言的轨，没有匹配则不启用）；支持 MP4 内嵌字幕（wvtt / tx3g 抽样提取转 VTT）、**MKV 内嵌字幕（SRT / ASS，三级引擎：PATH 有 ffmpeg 时子进程纯 demux 秒级提取；无 ffmpeg 时 Rust 原生 EBML 流式走读（内存恒定、任意大 MKV 可用）；两者都失败时前端 JS 流式兜底；提取中状态栏显示引擎名 / 百分比，可随时切走取消；ASS 经 ass-compiler 解析为斜体 / 粗体富文本）**、外挂同名 `.vtt` 直挂、外挂 `.srt` 自动转 VTT、**外挂 `.ass` / `.ssa` 富文本解析**（`电影.zh.srt` 之类的语言后缀会进菜单标签）；图形字幕（PGS / VOBSub）在菜单中置灰说明；没有字幕流时按钮禁用；HLS 字幕轨由 hls.js 自带渲染
 - **HLS**：本地 `.m3u8` + 分片目录直接可看（hls.js；asset 协议路径整体编码导致的相对分片失效已在前端重写解决）
 - **画面旋转**（`R` / 控制栏按钮）：每次顺时针 90°，任意角度下拖拽方向都跟手
 - **画面缩放**（`+` `-` / 滚轮无关，滚轮是音量）：1×~5× 步进 0.25，放大后**拖拽平移**（屏幕位移经逆旋变换换算，画面边缘不脱离舞台），右下角 HUD 显示当前倍率与角度
@@ -51,7 +55,7 @@
 | 类别 | 扩展名 | 播放 | 音轨 / 字幕分析 |
 |---|---|---|---|
 | **MP4 家族** | `mp4` `m4v` `mov` | 多音轨走 MSE（mp4box.js） | mp4box.js（多音轨 / 内嵌字幕 / 帧率） |
-| **Matroska 家族** | `mkv` `webm` | WebView 原生 | 手写 EBML 分析器（音轨 / 字幕轨 / 帧率）+ matroska-subtitles 字幕提取 |
+| **Matroska 家族** | `mkv` `webm` | WebView 原生 | 手写 EBML 分析器（音轨 / 字幕轨 / 帧率）+ 后端三级引擎字幕提取（ffmpeg / 原生 EBML / JS 兜底） |
 | **开放格式** | `ogv` `ogg` | WebView 原生 | —（单音轨直读） |
 | **尽力播放** | `avi` `3gp` | 取决于系统 WebView 解码器 | — |
 | **HLS** | `m3u8` | hls.js（分片走 asset 协议） | hls.js 音轨 / 字幕轨 |
@@ -233,6 +237,7 @@ jisu-kanpian/
 │   │   ├── format.js           # 展示格式化工具（时间/百分比/缩放标签）
 │   │   ├── media.js            # 扩展名/语言标签/编码名/字幕同名匹配/HLS 清单重写
 │   │   ├── subtitles.js        # WebVTT 统一出口（外挂 vtt/srt + 内嵌提取）
+│   │   ├── filestream.js       # 顺序流式读取器（read_range 分块，JS 兜底提取用）
 │   │   ├── wakelock.js         # 播放期间防屏保/休眠（Wake Lock + Rust 后备）
 │   │   ├── mp4/
 │   │   │   ├── analyzer.js     # moov 定位（头序读/尾扫描）+ 轨道信息
@@ -240,7 +245,7 @@ jisu-kanpian/
 │   │   └── mkv/
 │   │       ├── loader.js       # matroska-subtitles 浏览器 bundle 按需加载
 │   │       ├── tracks.js       # 手写 EBML 分析器（只读头部轨道表）
-│   │       ├── subtitles.js    # MKV 内嵌字幕提取（SRT/ASS → cue）
+│   │       ├── subtitles.js    # MKV 内嵌字幕三级调度（后端双引擎优先 → JS 流式兜底）
 │   │       ├── ass.js          # ASS/SSA → WebVTT 富文本（ass-compiler）
 │   │       └── vendor/         # matroska-subtitles.min.js（含 LICENSE）
 │   └── components/
@@ -262,7 +267,9 @@ jisu-kanpian/
         ├── scanner.rs          # 递归扫描 + 自然排序 + 外挂字幕收集（含单元测试）
         ├── state.rs            # 状态持久化（含单元测试）
         ├── power.rs            # 播放期间防屏保/休眠后备（含单元测试）
-        └── commands.rs         # Tauri IPC 命令（scan/read_range/stat/state/keep_awake/exit）
+        ├── mkvsub.rs           # MKV 内嵌字幕三级引擎（ffmpeg 子进程 / 原生 EBML 走读 + 进度）
+        ├── mkvsub/tests.rs     # 引擎单测（合成 MKV / 4GB 巨块 seek / ffmpeg 端到端 / 真实媒体对照）
+        └── commands.rs         # Tauri IPC 命令（scan/read_range/stat/extract/progress/state/keep_awake/exit）
 ```
 
 ---
@@ -270,12 +277,12 @@ jisu-kanpian/
 ## 性能与设计要点（为什么流畅）
 
 1. **播放零转码**：`<video>` 元素通过 asset 协议直接读取本地文件，seek / 音量 / 暂停全部由 WebView 原生媒体管线完成，不经过 IPC 传输媒体数据
-2. **moov / 轨道表分析零浪费**：MP4 的轨道信息只需要 moov 元数据区（通常几十 KB~几 MB），MKV 的轨道表在第一个 Cluster 之前的头部——两者都由 Rust `read_range` 按区间吐字节（moov 在文件头顺序读到、在文件尾特征扫描定位；MKV 从 512KB 起步扩窗至 16MB）；播放期间几 GB 的 mdat 媒体数据一个字节都不走 IPC，唯一例外是手动选择 MKV 内嵌字幕时的提取扫描（按 4MB 块流式过 IPC，内存恒定，见第 7 条）
+2. **moov / 轨道表分析零浪费**：MP4 的轨道信息只需要 moov 元数据区（通常几十 KB~几 MB），MKV 的轨道表在第一个 Cluster 之前的头部——两者都由 Rust `read_range` 按区间吐字节（moov 在文件头顺序读到、在文件尾特征扫描定位；MKV 从 512KB 起步扩窗至 16MB）；播放期间几 GB 的 mdat 媒体数据一个字节都不走 IPC，MKV 内嵌字幕提取也已在 v1.0.5 下沉到 Rust 侧完成（仅第三级 JS 兜底路径才按 4MB 块流式过 IPC，见第 7 条）
 3. **MSE 多音轨按需启用**：只有「多音轨且 MSE 支持至少一条音轨编码」的 MP4 才走 mp4box.js + MSE 双 SourceBuffer 路径（整文件读入内存，分段节流生成：前瞻超 24s 暂停、剩 12s 恢复，已送样例即时释放，内存稳定在 ~1× 文件大小）；两轨送完后 endOfStream 收尾（否则播到样本尽头不触发 ended，连播失效）；其余文件全部原生直读，零额外开销
 4. **同编码切轨画面不中断**：只清音频 SourceBuffer 并单独 `seekTrack` 重定位新轨，视频缓冲原封不动；异编码切轨（AAC ⇄ Opus 等）因 MSE 的 codecs 锁定与 Chromium 的 SourceBuffer 数量上限，采用**整个 MediaSource 重建**（mp4box 实例与整文件缓冲全程复用，零二次读盘），画面短暂重载后原位恢复
 5. **两段式精确 seek**：MSE 路径粗定位到目标前最近的关键帧（RAP），待该处媒体段进缓冲后自动精调到目标帧——断点恢复能落回退出帧，逐帧步进在已缓冲区直接精确落点
 6. **HLS 相对路径重写**：asset 协议把整个文件路径整体编码（`%2F` 不是路径分隔符），浏览器按 URL 规则解析相对分片会丢目录——前端拿到 m3u8 后按**文件系统路径**把每个分片与 `URI="…"` 属性重写为绝对 asset URL
-7. **字幕统一 WebVTT 出口 + MKV 流式提取**：MP4 内嵌 wvtt / tx3g 由 mp4box 抽样解出文本（MSE 模式复用引擎整文件缓冲，原生模式手动选择时才读入，超过 4GB 拒绝——mp4box 的 sample 提取要求字节全部驻留）；**MKV 内嵌 SRT / ASS 由 Rust `read_range` 按 4MB 块流式喂 matroska-subtitles（浏览器 bundle 按需加载 147KB，其它格式零开销）——内存占用恒定在 ~10MB 量级、与文件大小无关，几十 GB 的 MKV 也能提取，耗时只受磁盘顺序读速度限制（5GB ≈ SSD 数秒 / HDD 数十秒），提取中显示百分比，切换字幕 / 文件立即取消**；ASS / SSA（含外挂）由 ass-compiler 解析为斜体 / 粗体富文本，丢弃绘图指令与排版特效；外挂 srt 时间戳逗号→点转换；全部挂 `<track>`，浏览器原生渲染
+7. **字幕统一 WebVTT 出口 + MKV 三级引擎提取**：MP4 内嵌 wvtt / tx3g 由 mp4box 抽样解出文本（MSE 模式复用引擎整文件缓冲，原生模式手动选择时才读入，超过 4GB 拒绝——mp4box 的 sample 提取要求字节全部驻留）；**MKV 内嵌 SRT / ASS 走三级降级：① PATH 有 ffmpeg 时（探测一次即缓存）`-map 0:s:<n> -c:s copy` 纯 demux 直写 stdout，无转码无临时文件，5GB 文件秒级完成；② 无 ffmpeg / 失败时后端原生 EBML 流式走读（spawn_blocking 后台线程，视频/音频块 seek 跳过，只有目标轨字幕块进内存，速度只受磁盘顺序读限制）；③ 两者都失败才回退前端 JS 流式（matroska-subtitles 按需加载 147KB，分块喂入内存恒定）——后端报「轨道不存在 / 无内容」等定性错误时直接抛出不走兜底（JS 路径必撞同墙，白扫全文件只会浪费时间）；提取中状态栏显示引擎名 / 百分比（原生引擎按文件偏移轮询 query_extract_progress），切换字幕 / 文件立即作废**；ASS / SSA（含外挂）由 ass-compiler 解析为斜体 / 粗体富文本，丢弃绘图指令与排版特效；外挂 srt 时间戳逗号→点转换；全部挂 `<track>`，浏览器原生渲染
 8. **hls.js 按需加载**：只有播放 m3u8 时才动态 import（独立 chunk ~590KB），普通播放零负担
 9. **高频状态隔离**：`flat[]` 等大数据不进 Svelte 响应式；拖拽平移的 pan 更新走「值不变不写」+ untrack，避免 effect 自触发循环；进度文字用 timeupdate 节流
 10. **扫描在阻塞线程池**：`spawn_blocking` 执行递归扫描，UI 永不卡顿
@@ -291,11 +298,11 @@ jisu-kanpian/
 **Q：为什么有些 MP4 的内嵌字幕选不上？**
 v1 支持内嵌 wvtt（WebVTT-in-MP4）与 tx3g（mov_text）两种字幕编码，是最常见的两种；其他字幕编码（如 stpp）暂不支持，外挂 .vtt / .srt 不受影响。另：原生播放（非 MSE）模式下，MP4 内嵌字幕提取需要整文件读入内存，超过 4GB 的 MP4 会拒绝并提示改用外挂字幕（MSE 模式复用引擎缓冲无此限）。
 
-**Q：大文件 MKV（比如 5GB 以上）的内嵌字幕能用吗？**
-能。v1.0.4 起 MKV 内嵌字幕为流式提取：Rust 端按 4MB 块吐字节、前端边读边解析，内存占用恒定（与文件大小无关），没有任何大小限制；提取耗时只受磁盘顺序读速度限制（5GB ≈ SSD 数秒 / HDD 数十秒），状态栏会显示百分比，切走字幕 / 文件立即取消。v1.0.3 及之前因「整文件读入单个 ArrayBuffer」受 V8 约 4GB 上限约束，才有了「文件过大」的拒绝提示。
+**Q：大文件 MKV（比如 5GB 以上）的内嵌字幕能用吗？提取要多久？**
+能用且很快。v1.0.5 起为三级引擎：解析到 ffmpeg（v1.0.6 跨平台探测：Windows 依次找应用同目录与 PATH 里的 `ffmpeg.exe`（NTFS 大小写不敏感），Unix 找 PATH 里的 `ffmpeg`；装了 ffmpeg / 部分播放器套装会自动进 PATH；Windows 便携用户也可直接把 ffmpeg.exe 放在播放器 exe 旁边，免配 PATH）时纯 demux 拷贝流秒级完成（5GB 约 1~3 秒，受磁盘速度影响）；没有 ffmpeg 时后端 Rust 原生流式走读，速度只受磁盘顺序读限制（5GB ≈ SSD 数秒 / 机械硬盘数十秒）；两者都失败（罕见的 lacing 分帧 / 容器损伤）才回退前端 JS 流式（分钟级，但内存占用恒定无大小限制）。所有路径内存占用都与文件大小无关，状态栏会显示引擎名 / 百分比，切走字幕 / 文件立即取消。v1.0.3 及之前因「整文件读入单个 ArrayBuffer」受 V8 约 4GB 上限约束才有「文件过大」的拒绝提示（v1.0.4 流式化已废除）。
 
 **Q：内嵌字幕什么时候会自动选中？**
-默认按界面语言（中文）匹配：外挂中文字幕优先（零成本），内嵌中文字幕在 MSE 模式（文件已在内存）也会自动选中；MKV 内嵌（流式提取要扫全文件，大文件耗时数秒至数十秒）与原生模式 MP4 内嵌（整文件读入）默认不自动选，手动点击不受限。
+默认按界面语言（中文）匹配：外挂中文字幕优先（零成本），内嵌中文字幕在 MSE 模式（文件已在内存）也会自动选中；MKV 内嵌与原生模式 MP4 内嵌默认不自动选（提取要扫全文件或整文件读入，即使三级引擎已很快，也不适合静默自动触发），手动点击不受限。
 
 **Q：mkv / avi 能放吗？**
 取决于系统 WebView 的解码器（Windows WebView2 对 mkv 内的 H.264/AAC 通常可以，Linux WebKitGTK 视发行版而定）。不能播放时会提示「无法播放该文件」，其余文件不受影响。

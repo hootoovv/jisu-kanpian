@@ -8,7 +8,8 @@
  * - GET /files/<enc> → convertFileSrc 映射出的本地文件（视频 / 字幕 / HLS）
  * - POST /__invoke   → {cmd, args} 路由到 JS 版后端：
  *     scan_directory / read_range / stat_file / load_state / save_state /
- *     exit_app / plugin:dialog|open / plugin:window|*
+ *     extract_mkv_subtitles / query_extract_progress / exit_app /
+ *     plugin:dialog|open / plugin:window|*
  *
  * scan 的自然排序 / 扩展名 / 递归规则与 src-tauri/src/scanner.rs 保持一致。
  * save_state 的载荷会落盘 state-log.json，供测试断言持久化内容。
@@ -128,6 +129,50 @@ function scanDirectory(root) {
 let savedState = null;
 const invokeLog = [];
 
+/**
+ * 模拟「后端三级引擎正在运行」的窗口（extract_mkv_subtitles 快速路径
+ * 故意延迟 600ms 响应，让前端的进度轮询能真实观察到 running=true +
+ * method='ffmpeg'，而非一问就结束）。
+ */
+let extractState = null;
+
+/**
+ * multi.mkv 的 SRT 轨（TrackNumber=5）快速路径返回体：模拟后端
+ * ffmpeg 引擎的输出（完整 SRT 文档；内容与 make_testmedia.sh 的
+ * sub-zh.srt 一致）。真实实现见 src-tauri/src/mkvsub.rs。
+ */
+const MOCK_FAST_SRT = {
+  method: 'ffmpeg',
+  kind: 'utf8',
+  text: [
+    '1',
+    '00:00:00,500 --> 00:00:03,000',
+    '欢迎观看极速看片',
+    '',
+    '2',
+    '00:00:03,500 --> 00:00:07,000',
+    '这是第一条内嵌字幕（中文）',
+    '',
+    '3',
+    '00:00:07,500 --> 00:00:11,000',
+    '多音轨与字幕切换测试',
+    '',
+    '4',
+    '00:00:11,500 --> 00:00:15,000',
+    '画面旋转与缩放测试',
+    '',
+    '5',
+    '00:00:15,500 --> 00:00:19,000',
+    '断点记忆测试',
+    '',
+    '6',
+    '00:00:19,500 --> 00:00:23,000',
+    '再见'
+  ].join('\n'),
+  header: null,
+  blocks: null
+};
+
 function handleInvoke(cmd, args) {
   invokeLog.push({ cmd, t: Date.now() });
   switch (cmd) {
@@ -170,6 +215,27 @@ function handleInvoke(cmd, args) {
       savedState = args.state;
       fs.writeFileSync(STATE_LOG, JSON.stringify(args.state, null, 2));
       return { json: null };
+    case 'extract_mkv_subtitles': {
+      // 模拟后端三级引擎的 ①② 级（真实实现见 src-tauri/src/mkvsub.rs）：
+      // - multi.mkv 的 SRT 轨（TrackNumber=5）→ ffmpeg 快速路径（完整 SRT 文档，
+      //   延迟 600ms 响应让轮询可观察）；
+      // - 其余轨道（含 ASS 轨）→ 双引擎失败，驱动前端回退 ③ JS 流式兜底
+      const p = String(args.path || '');
+      const tn = Number(args.trackNumber);
+      if (p.endsWith('multi.mkv') && tn === 5) {
+        extractState = { running: true, method: 'ffmpeg', expireAt: Date.now() + 900 };
+        return { json: MOCK_FAST_SRT, delayMs: 600 };
+      }
+      extractState = null;
+      throw new Error('模拟后端双引擎失败（前端应回退 JS 流式兜底）');
+    }
+    case 'query_extract_progress': {
+      const st =
+        extractState && Date.now() < extractState.expireAt
+          ? { running: true, method: extractState.method, bytes: 0, total: 1_590_000 }
+          : { running: false, method: 'none', bytes: 0, total: 0 };
+      return { json: st };
+    }
     case 'set_keep_awake':
       // 防屏保 / 休眠后备命令（真机见 src-tauri/src/power.rs）
       console.log('[mock] set_keep_awake:', args.active);
@@ -223,13 +289,18 @@ const server = http.createServer((req, res) => {
       try {
         const { cmd, args } = JSON.parse(body || '{}');
         const out = handleInvoke(cmd, args || {});
-        if (out.bin) {
-          res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
-          res.end(out.bin);
-        } else {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(out.json ?? null));
-        }
+        const send = () => {
+          if (out.bin) {
+            res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+            res.end(out.bin);
+          } else {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(out.json ?? null));
+          }
+        };
+        // 快速路径模拟延迟（让前端轮询能观察到 running 状态）
+        if (out.delayMs) setTimeout(send, out.delayMs);
+        else send();
       } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: String(e.message || e) }));

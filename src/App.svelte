@@ -755,13 +755,20 @@
       let pctShown = -1;
       setStatus('正在提取内嵌字幕…');
       try {
+        // v1.0.5 三级引擎：后端 ffmpeg → 原生 EBML → JS 流式兜底
+        // （lib/mkv/subtitles.js 调度；进度 method 见 onProgress 第三参）
         const cues = await extractMkvSubtitles(currentVideoPath, size, num, tr, {
-          onProgress: (bytes, total) => {
+          onProgress: (bytes, total, method) => {
             if (gen !== subExtractGen) return;
+            if (method === 'ffmpeg') {
+              // ffmpeg demux 无内部进度：展示引擎名（秒级完成）
+              setStatus('正在提取内嵌字幕（ffmpeg 引擎）…');
+              return;
+            }
             const pct = total > 0 ? Math.min(100, Math.floor((bytes / total) * 100)) : 100;
             if (pct !== pctShown) {
               pctShown = pct;
-              setStatus(`正在提取内嵌字幕… ${pct}%`);
+              setStatus(`正在提取内嵌字幕${method === 'native' ? '（原生引擎）' : ''}… ${pct}%`);
             }
           },
           shouldAbort: () => gen !== subExtractGen
