@@ -1623,7 +1623,7 @@ dependencies = [
 
 [[package]]
 name = "jisu-kanpian"
-version = "1.0.2"
+version = "1.0.4"
 dependencies = [
  "dirs 5.0.1",
  "serde",

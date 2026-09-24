@@ -15,7 +15,8 @@
    *      SourceBuffer，不支持的编码在菜单里置灰），否则原生 <video>；
    *    - mkv / webm：手写 EBML 轨道分析器列出音轨与字幕轨（原生
    *      播放，音轨无法切换——Chromium 原生限制；内嵌 SRT/ASS 字幕
-   *      按 matroska-subtitles + ass-compiler 提取为 WebVTT 挂载）；
+   *      按 read_range 流式喂 matroska-subtitles 提取为 WebVTT 挂载，
+   *      内存恒定、无文件大小限制，提取中显示进度并可被取消）；
    *    - m3u8：hls.js（WebView 原生支持 HLS 时优先原生）；
    *    - 其余：原生 <video>（asset 协议直读本地文件）；
    * 3. 字幕统一 WebVTT：外挂 .vtt 直挂 <track>，.srt 转换后挂载，
@@ -61,13 +62,14 @@
   import { analyzeMp4 } from './lib/mp4/analyzer.js';
   import { MseEngine, isAudioCodecSupported } from './lib/mp4/mse-engine.js';
   import { analyzeMkv } from './lib/mkv/tracks.js';
-  import { extractMkvSubtitles, MAX_EXTRACT_BYTES } from './lib/mkv/subtitles.js';
+  import { extractMkvSubtitles } from './lib/mkv/subtitles.js';
   import { assToCues } from './lib/mkv/ass.js';
   import {
     SubtitleManager,
     extractEmbeddedSubtitles,
     loadSrtAsVtt,
-    cuesToVtt
+    cuesToVtt,
+    MAX_MP4_EXTRACT_BYTES
   } from './lib/subtitles.js';
 
   const win = getCurrentWebviewWindow();
@@ -130,6 +132,7 @@
   let unlistenDrop = null;
   let unlistenClose = null;
   let subManager = null;  // 字幕控制器（挂 <track> 用）
+  let subExtractGen = 0;  // 内嵌字幕提取代次（再次选择 / 换文件时作废进行中的提取）
 
   /* ---------- 媒体管线状态 ---------- */
   let mediaInfo = null;   // analyzeMp4 结果（或 null）
@@ -255,6 +258,7 @@
   /** 拆掉上一部片的引擎 / 字幕 / HLS */
   function teardownMedia() {
     mseLoading = false;
+    subExtractGen++; // 作废进行中的流式字幕提取（MKV 大文件提取耗时可观）
     if (engine) {
       engine.destroy();
       engine = null;
@@ -574,8 +578,9 @@
 
   /** 默认字幕：保存过的语言偏好 → 界面语言（中文） → 不启用。
    *  自动选中只限「零额外成本」的源：外挂文件、hls 字幕轨、MSE 模式
-   *  的 mp4 内嵌（文件字节已在内存）；mkv 内嵌与原生模式的 mp4 内嵌
-   *  需要整文件读入提取，只允许手动选择 */
+   *  的 mp4 内嵌（文件字节已在内存）；mkv 内嵌（已流式化、无大小限
+   *  制，但要扫全文件、大文件耗时数秒至数十秒）与原生模式的 mp4
+   *  内嵌（整文件读入）只允许手动选择 */
   function applyDefaultSubtitle() {
     const candidates = subOptions.filter((o) => o.key !== 'off' && !o.disabled);
     if (!candidates.length) {
@@ -737,7 +742,8 @@
       return;
     }
     if (key.startsWith('mkvsub:')) {
-      // MKV 内嵌字幕：整文件读入 → matroska-subtitles 提取目标轨
+      // MKV 内嵌字幕：read_range 流式喂入 matroska-subtitles 提取目标轨
+      // （内存恒定，任意大小文件可提取；耗时只受磁盘顺序读速度限制）
       const num = Number(key.slice(7));
       const tr = mediaInfo ? mediaInfo.subtitleTracks.find((t) => t.id === num) : null;
       if (!tr || !currentVideoPath) {
@@ -745,23 +751,29 @@
         return;
       }
       const size = Number(await invoke('stat_file', { path: currentVideoPath })) || 0;
-      if (size > MAX_EXTRACT_BYTES) {
-        setStatus('文件过大，暂不支持提取内嵌字幕');
-        subValue = 'off';
-        return;
-      }
+      const gen = ++subExtractGen; // 提取代次：换字幕 / 换文件 / teardown 时作废
+      let pctShown = -1;
       setStatus('正在提取内嵌字幕…');
       try {
-        const resp = await fetch(convertFileSrc(currentVideoPath));
-        if (!resp.ok) throw new Error(`读取文件失败：${resp.status}`);
-        const buf = await resp.arrayBuffer();
-        const cues = await extractMkvSubtitles(buf, num, tr);
+        const cues = await extractMkvSubtitles(currentVideoPath, size, num, tr, {
+          onProgress: (bytes, total) => {
+            if (gen !== subExtractGen) return;
+            const pct = total > 0 ? Math.min(100, Math.floor((bytes / total) * 100)) : 100;
+            if (pct !== pctShown) {
+              pctShown = pct;
+              setStatus(`正在提取内嵌字幕… ${pct}%`);
+            }
+          },
+          shouldAbort: () => gen !== subExtractGen
+        });
+        if (gen !== subExtractGen || !cues) return; // 已被新的选择 / 文件取代
         const vttText = cuesToVtt(cues);
         await subManager.attach({ vttText, lang: normLang(tr.lang), label });
         subLangPref = normLang(tr.lang) || subLangPref;
         scheduleSave();
         setStatus(`字幕：${label}`);
       } catch (e) {
+        if (gen !== subExtractGen) return;
         setStatus(e && e.message ? `内嵌字幕提取失败：${e.message}` : '内嵌字幕提取失败');
         subValue = 'off';
       }
@@ -775,8 +787,10 @@
         return;
       }
       const size = Number(await invoke('stat_file', { path: currentVideoPath })) || 0;
-      if (size > MAX_EXTRACT_BYTES) {
-        setStatus('文件过大，暂不支持提取内嵌字幕');
+      if (size > MAX_MP4_EXTRACT_BYTES) {
+        // mp4box.js 提取需整文件驻留内存（见 lib/subtitles.js 说明），
+        // 仅 MP4 原生模式有此限；MKV 已流式化无大小限制
+        setStatus('文件超过 4GB，暂不支持 MP4 内嵌字幕提取（可改用外挂 .srt/.ass）');
         subValue = 'off';
         return;
       }

@@ -15,6 +15,19 @@
 import { createFile, VTTin4Parser, TX3GParser } from 'mp4box';
 import { srtToVtt } from './media.js';
 
+/**
+ * MP4 内嵌字幕提取的大小上限（仅原生播放模式；MSE 模式复用引擎已
+ * 在内存的整文件缓冲，不受此限）。
+ *
+ * 为什么 MP4 路径仍要整文件读入：mp4box.js 的 sample 提取依赖其
+ * MultiBufferStream 持有全部已 append 的字节（moov 可能在文件尾部，
+ * sample 数据在 moov 解析后才能定位），增量 append 并不能减少驻留
+ * 内存，只能沿用整文件方案 + 大小护栏。MKV 路径已改 filestream.js
+ * 流式提取（无大小限制）；MP4 的流式化需要重写 mp4box 的缓冲管理，
+ * 收益低（MP4 内嵌文本字幕本身罕见），列为后续工作。
+ */
+export const MAX_MP4_EXTRACT_BYTES = 4 * 1024 * 1024 * 1024;
+
 /** 秒 → VTT 时间戳 "HH:MM:SS.mmm" */
 function vttStamp(sec) {
   if (!isFinite(sec) || sec < 0) sec = 0;

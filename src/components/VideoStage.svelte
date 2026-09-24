@@ -191,12 +191,12 @@
   role="presentation"
 >
   <!-- 左上角文件名：固定排版，不拦截鼠标 -->
-  <div class="now-title" aria-hidden="true">
+  <!-- <div class="now-title" aria-hidden="true">
     <div class="now-name" title={fileName}>{fileName || '—'}</div>
     {#if fileDir}
       <div class="now-rel" title={fileDir}>{fileDir}/</div>
     {/if}
-  </div>
+  </div> -->
 
   <!-- 缩放 / 旋转指示：非默认时右下角轻提示 -->
   {#if rotation !== 0 || zoom !== 1}
