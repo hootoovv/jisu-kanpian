@@ -89,6 +89,19 @@ WEBVTT
 00:00.03.500 --> 00:00.07.000
 这条来自同名 .zh.vtt 文件
 EOF
+cat > "$OUT/剧集/第01季/multi.zh.ass" <<'EOF'
+[Script Info]
+ScriptType: v4.00+
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, Bold, Outline
+Style: Default,Arial,20,&H00FFFFFF,0,2
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.50,0:00:03.00,Default,,0,0,0,,{\i1}外挂ASS字幕{\i0}斜体测试
+Dialogue: 0,0:00:03.50,0:00:07.00,Default,,0,0,0,,外挂ASS第二行
+EOF
 cp "$OUT/sub-en.srt" "$OUT/剧集/第01季/multi.en.srt"
 
 # ---------- 2. 单音轨 MP4（faststart，moov 在文件头）----------
@@ -111,6 +124,53 @@ $FF -f lavfi -i "testsrc2=size=640x360:rate=24:duration=10" \
     -f lavfi -i "sine=frequency=330:duration=10" \
     -c:v libvpx-vp9 -b:v 200k -c:a libopus -b:a 48k \
     "$OUT/剧集/第02季/clip.webm"
+
+# ---------- 4b. 多编码多音轨 MP4（AAC + Opus + AC3）：验证切轨 SourceBuffer 重建与不支持编码禁用 ----------
+$FF -f lavfi -i "testsrc2=size=640x360:rate=24:duration=14" \
+    -f lavfi -i "sine=frequency=440:duration=14" \
+    -f lavfi -i "sine=frequency=880:duration=14" \
+    -f lavfi -i "sine=frequency=220:duration=14" \
+    -map 0:v -map 1:a -map 2:a -map 3:a \
+    -c:v libx264 -preset veryfast -crf 28 -pix_fmt yuv420p \
+    -c:a:0 aac -b:a 64k -c:a:1 libopus -b:a 48k -c:a:2 ac3 -b:a 96k \
+    -metadata:s:a:0 language=chi -metadata:s:a:0 title="国语" \
+    -metadata:s:a:1 language=eng -metadata:s:a:1 title="English" \
+    -metadata:s:a:2 language=jpn -metadata:s:a:2 title="AC3" \
+    "$OUT/剧集/第01季/multicodec.mp4"
+
+# ---------- 4c. 多音轨 + 双字幕轨 MKV（ASS + SRT）：验证 MKV 分析与字幕提取 ----------
+# 视频 / 音频取 24s（字幕最长 23s）：避免「容器时长 > 视频流时长」
+# 导致快进触底后停在无数据区间、不触发 ended 连播
+cat > "$OUT/sub-ass.ass" <<'EOF'
+[Script Info]
+ScriptType: v4.00+
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, Bold, Outline
+Style: Default,Arial,20,&H00FFFFFF,0,2
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.50,0:00:03.00,Default,,0,0,0,,{\i1}内嵌ASS字幕{\i0}第一行\N第二行
+Dialogue: 0,0:00:03.50,0:00:07.00,Default,,0,0,0,,Second ASS line with {\b1}bold{\b0}
+Dialogue: 0,0:00:07.50,0:00:11.00,Default,,0,0,0,,多音轨 MKV 测试
+Dialogue: 0,0:00:11.50,0:00:14.00,Default,,0,0,0,,再见
+EOF
+$FF -f lavfi -i "testsrc2=size=640x360:rate=24:duration=24" \
+    -f lavfi -i "sine=frequency=440:duration=24" \
+    -f lavfi -i "sine=frequency=880:duration=24" \
+    -i "$OUT/sub-ass.ass" -i "$OUT/sub-zh.srt" \
+    -map 0:v -map 1:a -map 2:a -map 3:s -map 4:s \
+    -c:v libx264 -preset veryfast -crf 28 -pix_fmt yuv420p \
+    -c:a:0 aac -b:a 64k -c:a:1 libmp3lame -b:a 64k \
+    -c:s:0 copy -c:s:1 srt \
+    -metadata:s:a:0 language=chi -metadata:s:a:0 title="国语" \
+    -metadata:s:a:1 language=eng -metadata:s:a:1 title="English" \
+    -metadata:s:s:0 language=chi -metadata:s:s:0 title="简体中文" \
+    -metadata:s:s:1 language=eng -metadata:s:s:1 title="English" \
+    "$OUT/剧集/第01季/multi.mkv"
+rm -f "$OUT/sub-ass.ass"
+
 
 # ---------- 5. HLS 流（本地目录版 m3u8 + ts 分片）----------
 $FF -f lavfi -i "testsrc2=size=640x360:rate=24:duration=18" \

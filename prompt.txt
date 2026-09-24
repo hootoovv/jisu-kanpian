@@ -73,12 +73,54 @@ F1：显示所有快捷键
     （断点恢复因此能落回退出帧，与原生文件行为一致）；
 14. 「记住所有配置项」：音量、旋转角度、缩放倍率、音轨 / 字幕语言偏好、三个浮层可见性、
     每文件断点、退出恢复指针全部持久化；平移偏移与静音为临时状态（与参考项目静音处理一致）；
-15. 验证：npm run build 零警告（142 模块）；mock Tauri API 的无头浏览器冒烟测试 40/40
-    断言通过（ffmpeg 生成的真实多音轨 / 内嵌字幕 / HLS / WebM 测试媒体），先后抓获并修复
-    六个真实缺陷（详见架构设计第 6 节）；Rust 侧与极速听书同构，请在目标平台 cargo test
-    与 npm run tauri dev 复验完整 GUI 链路。
+15. 验证：npm run build 零警告（149 模块）；mock Tauri API 的无头浏览器冒烟测试 79/79
+    断言通过（ffmpeg 生成的真实多音轨 / 双编码 / MKV+ASS / 内嵌字幕 / HLS / WebM 测试
+    媒体），先后抓获并修复十二个真实缺陷（详见架构设计第 6 节）；Rust 纯逻辑模块已在
+    沙箱真实 cargo 编译并跑过全部单元测试，完整 GUI 链路请在目标平台 npm run tauri
+    dev 复验。
 
 ## 修订记录
+
+### v1.0.3（2026-09-24）
+
+1. 修复：切换音轨后不能播放选择的音轨——两处根因：
+   a) 默认音轨挑选未考虑 MSE 编码支持性（默认轨若是 AC-3 等不支持编码，
+      整个 MSE 装载直接失败回退原生，音轨切换完全不可用）；改为只在
+      MediaSource.isTypeSupported 认可的轨里按语言偏好挑默认，不支持的
+      编码在菜单里置灰并标注原因；
+   b) 异编码切换（AAC ⇄ Opus 等）时音频 SourceBuffer 的 codecs 已在创建
+      时锁定，塞新编码的 init 触发解码管线错误；实测 Chromium 对同一
+      MediaSource 有 SourceBuffer 数量上限（remove 后 add 直接抛
+      "reached the limit"），remove+add 换 SB 不可行——改为整个
+      MediaSource 重建（mp4box 实例与整文件缓冲全程复用，零二次读盘），
+      视频 SB 沿用原编码、音频 SB 用目标编码，两条轨道重新定位到切换前
+      播放位置后恢复；同编码切换仍走无感路径（视频画面不中断）；
+2. 修复（连带挖出的潜伏缺陷）：MSE 文件播到末尾不触发 ended（快进触底 /
+   连播失效）——元数据时长比实际样本末尾长一点，只 appendBuffer 不收尾
+   就会在「时长未到」处无限等数据；两轨送完后把 duration 校准到实际缓冲
+   末尾再 endOfStream()；onSegment 第 5 参 last 此前未透传（收尾机制的
+   前提）；收尾后 engine.ready 必须接受 readyState='ended'（否则切轨被
+   误判为不可用）；_doneTracks 跨 seek/切轨世代污染会使节流暂停时误收尾；
+3. 新增：MKV / WebM 轨道分析与内嵌字幕——手写 EBML 分析器只读第一个
+   Cluster 之前的头部轨道表（512KB 起步扩窗至 16MB，媒体数据永不过
+   IPC），音轨（含编码名）/ 字幕轨进菜单；内嵌 SRT / ASS 字幕由
+   matroska-subtitles（官方浏览器 bundle，147KB，vendor 固定版本 +
+   首次遇到 MKV 才动态加载）流式提取，ASS 经 ass-compiler 解析为斜体 /
+   粗体富文本（重组完整 ASS 文档：CodecPrivate 头 + 按块时间戳重建
+   Dialogue 行）；图形字幕（PGS/VOBSub）置灰说明；MKV 音轨原生播放无法
+   切换（Chromium 限制，菜单保留并提示）；
+4. 新增：外挂 .ass / .ssa 字幕（同名匹配，解析为富文本后挂载）；
+   Rust 扫描器 SUB_EXTS 扩展 ass/ssa；
+5. JS 包调研（详见架构设计 §3.6）：matroska（纯 Node 不可用）、
+   ebml/ebml-block（仅底层且 Node 流式）、libass-wasm（7.7MB + CJK
+   字体问题）均弃用；采用 matroska-subtitles + ass-compiler；
+6. 踩坑记录（架构设计 §3.2 / §3.6）：EBML 8 字节 vint 超出 JS 安全整数
+   （浮点舍入把 82 读成 80，整棵树错位，改为按字节剥标记位）；ffmpeg 的
+   未知尺寸形态是 01+全 0 而非规范的全 1；mock 服务器补 Range/206 与
+   Content-Length（原生 <video> 的 seek 依赖字节范围请求）；
+7. 验证：冒烟测试扩至 79 项断言（新增 MKV 分析/字幕提取/双编码切轨
+   重建/置灰拦截/播放持续推进数值断言），两遍回归全绿；scanner.rs 以
+   独立 crate 真实 cargo 编译 + 4 项单元测试通过。
 
 ### v1.0.2（2026-09-23）
 

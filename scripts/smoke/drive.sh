@@ -4,15 +4,24 @@
 # 前置：
 #   1. npm run build（dist/ 为最新构建）
 #   2. bash scripts/make_testmedia.sh（生成 /home/z/my-project/testmedia）
-#   3. node scripts/smoke/server.mjs（mock Tauri API 服务器，默认 :4174）
-#   4. agent-browser install（无头浏览器）
+#   3. agent-browser install（无头浏览器）
 #
-# 用法：bash scripts/smoke/drive.sh
+# 用法：node scripts/smoke/server.mjs &  →  bash scripts/smoke/drive.sh
 # 输出：每步 PASS/FAIL 汇总 + scripts/smoke/shots/ 截图
+#
+# 文件自然顺序（7 个视频）：
+#   1 hls/playlist.m3u8（HLS）
+#   2 剧集/第01季/multi.mkv（MKV 双音轨 + ASS/SRT 内嵌字幕，原生播放）
+#   3 剧集/第01季/multi.mp4（MSE 三音轨同编码 AAC + tx3g 内嵌 + 外挂）
+#   4 剧集/第01季/multicodec.mp4（MSE AAC/Opus/AC3 三编码——切轨重建 SB）
+#   5 剧集/第01季/single-fast.mp4
+#   6 剧集/第02季/clip.webm
+#   7 剧集/第02季/single-tail.mp4
 set -u
 cd "$(dirname "$0")/../.."
 BASE=http://localhost:4174
-SHOTS=scripts/smoke/shots
+# agent-browser 的截图落盘相对其守护进程 cwd（与 shell 不同），必须绝对路径
+SHOTS="$(cd "$(dirname "$0")/shots" && pwd)"
 mkdir -p "$SHOTS"
 PASS=0; FAIL=0
 
@@ -49,45 +58,57 @@ agent-browser eval "window.__pageErrors=[];'ok'" >/dev/null
 agent-browser find text "选择视频文件夹" click >/dev/null 2>&1
 agent-browser wait 4000 >/dev/null 2>&1
 ck "进入播放界面（文件列表浮层）" "$(j "!!document.querySelector('.filelist')")" "true"
-ck "视频共 5 个文件" "$(j "document.querySelector('.infobar').textContent.slice(-6)")" "1 / 5"
+ck "视频共 7 个文件" "$(j "document.querySelector('.infobar').textContent.slice(-6)")" "1 / 7"
 ck "首文件为 HLS（blob: MSE 源）" "$(j "document.querySelector('video').src.slice(0,5)")" "blob:"
 agent-browser wait 3000 >/dev/null 2>&1
 ck "HLS 缓冲就绪（readyState=4）" "$(j "document.querySelector('video').readyState")" "4"
 
-# ---- 3. 播放 / 暂停 / 快进快退 ----
-# 无头环境的自动播放策略可能拦截首次 play()（应用按设计 toast 提示）。
-# 这里用一次真实点击提供用户激活，确保后续链路可测。
+# ---- 3. 播放 / 快进触底连播 → multi.mkv（MKV：分析 + 菜单 + 内嵌字幕提取） ----
 if [ "$(j "document.querySelector('video').paused")" = "true" ]; then
-  # 坐标点击 = mouse move + down + up（真实事件，带用户激活）
   agent-browser mouse move 640 300 >/dev/null 2>&1
   agent-browser mouse down left >/dev/null 2>&1
   agent-browser mouse up left >/dev/null 2>&1
   agent-browser wait 1200 >/dev/null 2>&1
 fi
 ck "点击画面开始播放" "$(j "!document.querySelector('video').paused")" "true"
-T1=$(j "document.querySelector('video').currentTime.toFixed(1)")
-ck "播放位置前进（t>0）" "$T1" "."
-agent-browser press ArrowRight >/dev/null 2>&1; agent-browser wait 300 >/dev/null 2>&1
-ck "快进 30s 触底自动连播（文件序号变化）" "$(j "document.querySelector('.infobar').textContent.slice(-6)")" "2 / 5"
-ck "multi.mp4 走 MSE（blob: 源）" "$(j "document.querySelector('video').src.slice(0,5)")" "blob:"
-ck "多音轨菜单可用（音轨 · 中文 = 默认界面语言）" "$(j "document.querySelectorAll('.pill')[0].textContent.trim()")" "音轨 · 中文"
-ck "默认字幕匹配界面语言（外挂 zh.vtt）" "$(j "document.querySelectorAll('.pill')[1].textContent.trim()")" "中文 · 外挂"
+agent-browser press ArrowRight >/dev/null 2>&1; agent-browser wait 800 >/dev/null 2>&1
+ck "快进 30s 触底自动连播 → multi.mkv" "$(j "document.querySelector('.infobar').textContent.slice(-6)")" "2 / 7"
+ck "MKV 走原生播放（/files/ 直读源）" "$(j "document.querySelector('video').src.includes('/files/')")" "true"
+agent-browser wait 1500 >/dev/null 2>&1
+# 音轨菜单：MKV 分析器列出双轨（AAC + MP3），原生播放无法切换
+agent-browser eval "document.querySelector('button[aria-label=选择音轨]').click();1" >/dev/null
+agent-browser wait 400 >/dev/null 2>&1
+ck "MKV 音轨菜单 2 条（国语·AAC / English·MP3）" "$(j "document.querySelectorAll('.menu-item').length")" "2"
+agent-browser eval "(()=>{const it=[...document.querySelectorAll('.menu-item')];it.find(i=>i.textContent.includes('English')).click();return 1})()" >/dev/null
+agent-browser wait 600 >/dev/null 2>&1
+ck "MKV 选轨切换为展示态（English · MP3）" "$(j "document.querySelectorAll('.pill')[0].textContent.trim()")" "音轨 · English · MP3"
 agent-browser press Space >/dev/null 2>&1
-ck "空格暂停" "$(j "document.querySelector('video').paused")" "true"
+agent-browser wait 400 >/dev/null 2>&1
+# 字幕菜单：不启用 + 内嵌 ass + 内嵌 srt + 外挂（ass/srt/vtt）= 6 项
+agent-browser eval "document.querySelector('button[aria-label=选择字幕]').click();1" >/dev/null
+agent-browser wait 400 >/dev/null 2>&1
+ck "MKV 字幕菜单 6 项（内嵌×2 + 外挂×3 + 不启用）" "$(j "document.querySelectorAll('.menu-item').length")" "6"
+agent-browser eval "(()=>{const it=[...document.querySelectorAll('.menu-item')];it.find(i=>i.textContent.includes('内嵌 srt')).click();return 1})()" >/dev/null
+agent-browser wait 2500 >/dev/null 2>&1
+ck "MKV 内嵌 SRT 提取（cue 数 = 6）" "$(j "(document.querySelector('video').querySelector('track')||{}).track?.cues?.length || 0")" "6"
+# 后选 ASS（chi）：最终语言偏好回到 zh（影响下一文件的默认字幕）
+agent-browser eval "document.querySelector('button[aria-label=选择字幕]').click();1" >/dev/null
+agent-browser wait 400 >/dev/null 2>&1
+agent-browser eval "(()=>{const it=[...document.querySelectorAll('.menu-item')];it.find(i=>i.textContent.includes('内嵌 ass')).click();return 1})()" >/dev/null
+agent-browser wait 3000 >/dev/null 2>&1
+ck "MKV 内嵌 ASS 提取（cue 数 = 4）" "$(j "(document.querySelector('video').querySelector('track')||{}).track?.cues?.length || 0")" "4"
+ck "MKV ASS 富文本（斜体标签进 cue）" "$(j "(document.querySelector('video').querySelector('track').track.cues[0].text.includes('<i>')) + ''")" "true"
+agent-browser screenshot "$SHOTS/smoke-mkv-subs.png" >/dev/null 2>&1
 
 # ---- 3b. 画面点击：单击播放/暂停 + 双击全屏 + 全屏隐藏全部浮层 + 防休眠 ----
 # 直接在 VideoStage 根元素上派发 PointerEvent（不依赖自动播放策略，
-# 确保点击链路被真实执行——此前 press 仅在放大时记录，默认缩放下
-# 单击/双击完全失效，而旧用例因守卫跳过点击而漏测）。
-# 全屏规格（v1.0.2）：进入全屏 = 纯画面模式，顶栏 / 底栏 / 文件列表
-# 浮层一律立即隐藏（暂停中也隐藏），鼠标活动不浮现，退出后按偏好恢复。
+# 确保点击链路被真实执行）。全屏规格（v1.0.2）：进入全屏 = 纯画面模式。
 STAGE="document.querySelector('video').parentElement"
 CLICK="(()=>{const st=$STAGE;const mk=t=>new PointerEvent(t,{bubbles:true,cancelable:true,clientX:300,clientY:300,button:0,pointerId:9,isPrimary:true});st.dispatchEvent(mk('pointerdown'));st.dispatchEvent(mk('pointerup'));return 'ok'})()"
 DBLCLK="(()=>{const st=$STAGE;const mk=t=>new PointerEvent(t,{bubbles:true,cancelable:true,clientX:300,clientY:300,button:0,pointerId:9,isPrimary:true});st.dispatchEvent(mk('pointerdown'));st.dispatchEvent(mk('pointerup'));st.dispatchEvent(mk('pointerdown'));st.dispatchEvent(mk('pointerup'));return 'ok'})()"
 agent-browser eval "$CLICK" >/dev/null
 agent-browser wait 450 >/dev/null 2>&1
-ck "默认缩放下单击画面 = 播放（回归：press 修复）" "$(j "!document.querySelector('video').paused")" "true"
-# 播放中 → 防屏保/休眠（mock 用 getter 遮蔽 wakeLock，走可观测的 Rust 后备命令）
+ck "单击画面 = 播放" "$(j "!document.querySelector('video').paused")" "true"
 agent-browser wait 400 >/dev/null 2>&1
 ck "播放中已请求保持唤醒（set_keep_awake 后备命令）" "$(j "window.__invokeLog().includes('set_keep_awake')")" "true"
 ck "播放中保持唤醒生效（jsLock 或后禁 rustOn 持锁）" "$(j "(()=>{const s=window.__wakeLockState();return s.wanted&&(s.rustOn||s.jsLock)})()")" "true"
@@ -96,13 +117,12 @@ agent-browser wait 450 >/dev/null 2>&1
 ck "再单击画面 = 暂停" "$(j "document.querySelector('video').paused")" "true"
 agent-browser wait 400 >/dev/null 2>&1
 ck "暂停后解除保持唤醒（三项全部归零）" "$(j "(()=>{const s=window.__wakeLockState();return !s.wanted&&!s.rustOn&&!s.jsLock})()")" "true"
-# 暂停中双击进入全屏（第一击的播放定时器被第二击取消，不改变播放状态）
 agent-browser eval "$DBLCLK" >/dev/null
 agent-browser wait 400 >/dev/null 2>&1
-ck "暂停中双击进入全屏（播放定时器被取消，仍暂停）" "$(j "document.querySelector('video').paused")" "true"
-ck "全屏立即隐藏：顶栏（暂停中也隐藏——本次修复点）" "$(j "!document.querySelector('.infobar')")" "true"
+ck "暂停中双击进入全屏（仍暂停）" "$(j "document.querySelector('video').paused")" "true"
+ck "全屏立即隐藏：顶栏" "$(j "!document.querySelector('.infobar')")" "true"
 ck "全屏立即隐藏：底栏" "$(j "!document.querySelector('.ctrlbar')")" "true"
-ck "全屏立即隐藏：文件列表浮层（本次新增）" "$(j "!document.querySelector('.list-overlay')")" "true"
+ck "全屏立即隐藏：文件列表浮层" "$(j "!document.querySelector('.list-overlay')")" "true"
 agent-browser screenshot "$SHOTS/smoke-fs-hidden.png" >/dev/null 2>&1
 agent-browser eval "window.dispatchEvent(new PointerEvent('pointermove',{bubbles:true}));'ok'" >/dev/null
 agent-browser wait 300 >/dev/null 2>&1
@@ -122,33 +142,84 @@ ck "双击退出全屏：底栏按偏好恢复" "$(j "!!document.querySelector('
 ck "双击退出全屏：文件列表按偏好恢复" "$(j "!!document.querySelector('.list-overlay')")" "true"
 agent-browser wait 1200 >/dev/null 2>&1
 ck "非全屏浮层常显（不受闲置影响）" "$(j "!!document.querySelector('.infobar') && !!document.querySelector('.ctrlbar')")" "true"
-# 收尾：仍为暂停态，回退到 2s（后续音轨/字幕节的断言依赖仍在 multi.mp4 内）
-agent-browser eval "(()=>{const v=document.querySelector('video');v.currentTime=2;return 1})()" >/dev/null
-agent-browser wait 400 >/dev/null 2>&1
 
-# ---- 4. 音轨切换（MSE 双 SourceBuffer） ----
+# ---- 4. multi.mp4（MSE 同编码三音轨）：音轨切换回归 + 内嵌/外挂字幕 ----
+agent-browser press Space >/dev/null 2>&1
+agent-browser wait 400 >/dev/null 2>&1
+agent-browser press ArrowRight >/dev/null 2>&1
+agent-browser wait 2500 >/dev/null 2>&1
+ck "快进触底连播 → multi.mp4（3/7）" "$(j "document.querySelector('.infobar').textContent.slice(-6)")" "3 / 7"
+ck "multi.mp4 走 MSE（blob: 源）" "$(j "document.querySelector('video').src.slice(0,5)")" "blob:"
+agent-browser wait 1200 >/dev/null 2>&1
+ck "默认音轨匹配界面语言（中文）" "$(j "document.querySelectorAll('.pill')[0].textContent.trim()")" "音轨 · 中文"
+ck "默认字幕匹配界面语言（外挂 ass 优先命中）" "$(j "document.querySelectorAll('.pill')[1].textContent.trim()")" "中文 · 外挂 ass"
 agent-browser eval "document.querySelector('button[aria-label=选择音轨]').click();1" >/dev/null
 agent-browser wait 400 >/dev/null 2>&1
-ck "音轨菜单 3 条（中/英/日）" "$(j "document.querySelectorAll('.menu-item').length")" "3"
+ck "音轨菜单 3 条（中/英/日，无置灰）" "$(j "document.querySelectorAll('.menu-item').length + '/' + document.querySelectorAll('.menu-item.dim').length")" "3/0"
+T1=$(j "document.querySelector('video').currentTime.toFixed(2)")
 agent-browser eval "(()=>{const it=[...document.querySelectorAll('.menu-item')];it.find(i=>i.textContent.includes('英语')).click();return 1})()" >/dev/null
-agent-browser wait 2000 >/dev/null 2>&1
-ck "切换到英语音轨" "$(j "document.querySelectorAll('.pill')[0].textContent.trim()")" "音轨 · 英语"
-
-# ---- 5. 字幕：内嵌提取 / 外挂 srt ----
+agent-browser wait 1800 >/dev/null 2>&1
+ck "切换到英语音轨（同编码 AAC）" "$(j "document.querySelectorAll('.pill')[0].textContent.trim()")" "音轨 · 英语"
+ck "切换后仍为 MSE 播放（未触发回退）" "$(j "document.querySelector('video').src.slice(0,5)")" "blob:"
+T2=$(j "document.querySelector('video').currentTime.toFixed(2)")
+ck "切换后播放持续推进（t 前进 $T1 → $T2）" "$(j "(document.querySelector('video').currentTime > $T1) + ''")" "true"
+ck "切换后无解码错误" "$(j "(document.querySelector('video').error === null) + ''")" "true"
+# 字幕：内嵌 tx3g 提取 / 外挂 srt
+agent-browser press Space >/dev/null 2>&1
+agent-browser wait 400 >/dev/null 2>&1
 agent-browser eval "document.querySelector('button[aria-label=选择字幕]').click();1" >/dev/null
 agent-browser wait 400 >/dev/null 2>&1
-ck "字幕菜单 5 项（不启用+2内嵌+2外挂）" "$(j "document.querySelectorAll('.menu-item').length")" "5"
+ck "字幕菜单 6 项（不启用+2内嵌+3外挂）" "$(j "document.querySelectorAll('.menu-item').length")" "6"
 agent-browser eval "(()=>{const it=[...document.querySelectorAll('.menu-item')];it.find(i=>i.textContent.includes('中文')&&i.textContent.includes('内嵌')).click();return 1})()" >/dev/null
 agent-browser wait 2500 >/dev/null 2>&1
 ck "内嵌 tx3g 提取成功（cue 数 = 6）" "$(j "(document.querySelector('video').querySelector('track')||{}).track?.cues?.length || 0")" "6"
 agent-browser eval "document.querySelector('button[aria-label=选择字幕]').click();1" >/dev/null
 agent-browser wait 400 >/dev/null 2>&1
-agent-browser eval "(()=>{const it=[...document.querySelectorAll('.menu-item')];it.find(i=>i.textContent.includes('srt')).click();return 1})()" >/dev/null
+agent-browser eval "(()=>{const it=[...document.querySelectorAll('.menu-item')];it.find(i=>i.textContent.includes('srt')&&!i.textContent.includes('内嵌')).click();return 1})()" >/dev/null
 agent-browser wait 1500 >/dev/null 2>&1
 ck "外挂 srt 转换挂载（cue 数 = 6）" "$(j "(document.querySelector('video').querySelector('track')||{}).track?.cues?.length || 0")" "6"
 agent-browser press Space >/dev/null 2>&1
-agent-browser wait 1200 >/dev/null 2>&1
+agent-browser wait 800 >/dev/null 2>&1
 agent-browser screenshot "$SHOTS/smoke-subs.png" >/dev/null 2>&1
+
+# ---- 4b. multicodec.mp4（AAC + Opus + AC3）：不支持编码置灰 + 切轨 SourceBuffer 重建 ----
+agent-browser press ArrowRight >/dev/null 2>&1
+agent-browser wait 2500 >/dev/null 2>&1
+ck "快进触底连播 → multicodec.mp4（4/7）" "$(j "document.querySelector('.infobar').textContent.slice(-6)")" "4 / 7"
+ck "multicodec 走 MSE（blob: 源）" "$(j "document.querySelector('video').src.slice(0,5)")" "blob:"
+agent-browser press Space >/dev/null 2>&1
+agent-browser wait 400 >/dev/null 2>&1
+ck "语言偏好默认轨 = 英语（Opus，上一文件切换保存）" "$(j "document.querySelectorAll('.pill')[0].textContent.trim()")" "音轨 · 英语"
+agent-browser eval "document.querySelector('button[aria-label=选择音轨]').click();1" >/dev/null
+agent-browser wait 400 >/dev/null 2>&1
+ck "三编码菜单 3 条，AC3 置灰 1 条" "$(j "document.querySelectorAll('.menu-item').length + '/' + document.querySelectorAll('.menu-item.dim').length")" "3/1"
+ck "置灰项标注原因（AC-3 不支持）" "$(j "document.querySelector('.menu-item.dim').textContent")" "AC-3 不支持"
+agent-browser eval "document.querySelector('.menu-item.dim').click();1" >/dev/null
+agent-browser wait 500 >/dev/null 2>&1
+ck "置灰项点击无效（仍英语轨）" "$(j "document.querySelectorAll('.pill')[0].textContent.trim()")" "音轨 · 英语"
+# 切中文：AAC ← Opus —— 编码不同，音频 SourceBuffer 整体重建
+agent-browser press Space >/dev/null 2>&1
+agent-browser wait 300 >/dev/null 2>&1
+T3=$(j "document.querySelector('video').currentTime.toFixed(2)")
+agent-browser eval "document.querySelector('button[aria-label=选择音轨]').click();1" >/dev/null
+agent-browser wait 400 >/dev/null 2>&1
+agent-browser eval "(()=>{const it=[...document.querySelectorAll('.menu-item')];it.find(i=>i.textContent.includes('中文')).click();return 1})()" >/dev/null
+agent-browser wait 1600 >/dev/null 2>&1
+ck "切轨（Opus→AAC，SB 重建）选中" "$(j "document.querySelectorAll('.pill')[0].textContent.trim()")" "音轨 · 中文"
+ck "重建后仍为 MSE（未触发回退）" "$(j "document.querySelector('video').src.slice(0,5)")" "blob:"
+ck "重建后播放持续推进" "$(j "(document.querySelector('video').currentTime > $T3) + ''")" "true"
+ck "重建后无解码错误" "$(j "(document.querySelector('video').error === null) + ''")" "true"
+# 再切回英语：AAC → Opus —— 反向重建
+T4=$(j "document.querySelector('video').currentTime.toFixed(2)")
+agent-browser eval "document.querySelector('button[aria-label=选择音轨]').click();1" >/dev/null
+agent-browser wait 400 >/dev/null 2>&1
+agent-browser eval "(()=>{const it=[...document.querySelectorAll('.menu-item')];it.find(i=>i.textContent.includes('英语')).click();return 1})()" >/dev/null
+agent-browser wait 1600 >/dev/null 2>&1
+ck "反向切轨（AAC→Opus）选中" "$(j "document.querySelectorAll('.pill')[0].textContent.trim()")" "音轨 · 英语"
+ck "反向重建后播放持续推进" "$(j "(document.querySelector('video').currentTime > $T4) + ''")" "true"
+ck "反向重建后无解码错误" "$(j "(document.querySelector('video').error === null) + ''")" "true"
+agent-browser press Space >/dev/null 2>&1
+agent-browser wait 400 >/dev/null 2>&1
 
 # ---- 6. 旋转 / 缩放 / 拖拽 ----
 agent-browser eval "window.dispatchEvent(new KeyboardEvent('keydown',{key:'r'}))" >/dev/null
@@ -209,6 +280,7 @@ agent-browser wait 6000 >/dev/null 2>&1
 ck "重启后恢复到退出位置（t≈5）" "$(j "((Math.abs(document.querySelector('video').currentTime-5)<0.6) + ' t=' + document.querySelector('video').currentTime.toFixed(2))")" "true"
 ck "恢复后为暂停状态" "$(j "document.querySelector('video').paused")" "true"
 ck "恢复旋转角度（90°）" "$(j "document.querySelector('video').style.transform")" "rotate(90deg)"
+ck "恢复后默认音轨仍按语言偏好（英语）" "$(j "document.querySelectorAll('.pill')[0].textContent.trim()")" "音轨 · 英语"
 agent-browser screenshot "$SHOTS/smoke-restore.png" >/dev/null 2>&1
 
 # ---- 12. X 关闭目录 → 引导页 + 清记忆 ----

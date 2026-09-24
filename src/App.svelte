@@ -11,12 +11,19 @@
    * 2. 播放管线按文件类型分流：
    *    - mp4 家族：先经 read_range 只读 moov 做轨道分析（mp4box.js），
    *      多音轨且 MSE 支持时启用 MseEngine（mp4box 分段 + 双
-   *      SourceBuffer，音轨可即时切换），否则原生 <video> 直读；
+   *      SourceBuffer，音轨可即时切换；切换编码不同的轨会重建音频
+   *      SourceBuffer，不支持的编码在菜单里置灰），否则原生 <video>；
+   *    - mkv / webm：手写 EBML 轨道分析器列出音轨与字幕轨（原生
+   *      播放，音轨无法切换——Chromium 原生限制；内嵌 SRT/ASS 字幕
+   *      按 matroska-subtitles + ass-compiler 提取为 WebVTT 挂载）；
    *    - m3u8：hls.js（WebView 原生支持 HLS 时优先原生）；
    *    - 其余：原生 <video>（asset 协议直读本地文件）；
    * 3. 字幕统一 WebVTT：外挂 .vtt 直挂 <track>，.srt 转换后挂载，
-   *    MP4 内嵌 wvtt / tx3g 由 mp4box 抽样提取后生成 VTT blob；
-   *    hls.js 的字幕轨走其自带 textTracks；
+   *    .ass/.ssa 由 ass-compiler 解析为富文本（<i>/<b>/<u>）后挂载；
+   *    MP4 内嵌 wvtt / tx3g 由 mp4box 抽样提取；MKV 内嵌 SRT / ASS
+   *    由 matroska-subtitles 提取（ASS 同样走 ass-compiler）；
+   *    hls.js 的字幕轨走其自带 textTracks；图形字幕（PGS/VOBSub）
+   *    在菜单中置灰并说明；
    * 4. 画面支持旋转（顺时针 90° 步进）与放大缩小（1×~5×），
    *    放大后可拖拽平移（VideoStage 内做屏幕位移 → 画面坐标系的
    *    逆旋变换）；
@@ -41,9 +48,21 @@
   import HelpOverlay from './components/HelpOverlay.svelte';
   import { clamp } from './lib/format.js';
   import { initWakeLock, setKeepAwake } from './lib/wakelock.js';
-  import { MP4_FAMILY, extOf, langLabel, normLang, matchSubs, rewriteHlsPlaylist } from './lib/media.js';
+  import {
+    MP4_FAMILY,
+    MKV_FAMILY,
+    extOf,
+    langLabel,
+    normLang,
+    matchSubs,
+    rewriteHlsPlaylist,
+    codecPretty
+  } from './lib/media.js';
   import { analyzeMp4 } from './lib/mp4/analyzer.js';
-  import { MseEngine } from './lib/mp4/mse-engine.js';
+  import { MseEngine, isAudioCodecSupported } from './lib/mp4/mse-engine.js';
+  import { analyzeMkv } from './lib/mkv/tracks.js';
+  import { extractMkvSubtitles, MAX_EXTRACT_BYTES } from './lib/mkv/subtitles.js';
+  import { assToCues } from './lib/mkv/ass.js';
   import {
     SubtitleManager,
     extractEmbeddedSubtitles,
@@ -260,11 +279,18 @@
     subValue = 'off';
   }
 
-  /** mp4 家族轨道分析（快速：只读 moov） */
+  /** mp4 家族轨道分析（快速：只读 moov）；失败静默回退原生播放 */
   function analyzeEntry(entry) {
-    // 分析失败静默回退原生播放（打一条 warn 便于排查）
     return analyzeMp4(entry.path).catch((e) => {
       console.warn('轨道分析失败，回退原生播放', entry.path, e);
+      return null;
+    });
+  }
+
+  /** Matroska 家族轨道分析（快速：只读头部轨道表）；失败静默回退 */
+  function analyzeEntryMkv(entry) {
+    return analyzeMkv(entry.path).catch((e) => {
+      console.warn('MKV 轨道分析失败，回退原生播放', entry.path, e);
       return null;
     });
   }
@@ -276,6 +302,19 @@
     if (byPref) return byPref;
     const byUi = tracks.find((t) => normLang(t.lang) === 'zh');
     return byUi || tracks[0];
+  }
+
+  /** mp4 音轨菜单项（含 MSE 支持性标注：不支持的编码置灰不可选） */
+  function mp4AudioOption(t) {
+    const ok = isAudioCodecSupported(t.codec);
+    const pretty = codecPretty(t.codec);
+    return {
+      key: `mp4:${t.id}`,
+      label: ok ? langLabel(t.lang, t.name) : `${langLabel(t.lang, t.name)} · ${pretty} 不支持`,
+      codec: t.codec,
+      disabled: !ok,
+      hint: `WebView MSE 不支持 ${pretty} 编码，无法切换`
+    };
   }
 
   /**
@@ -304,17 +343,21 @@
         mediaInfo = info;
         if (info.video) fpsKnown = info.video.fps || 0;
         const multiAudio = info.audioTracks.length > 1;
-        if (multiAudio && typeof MediaSource !== 'undefined') {
-          const defTrack = pickAudioTrack(info.audioTracks);
+        // 只要有「MSE 支持编码」的音轨就走 MSE；默认轨在支持轨里挑
+        // （此前直接按语言挑默认轨，若默认轨是 AC-3 等不支持编码，
+        // 整个 MSE 装载直接失败回退原生，音轨切换完全不可用）
+        const supported = info.audioTracks.filter((t) => isAudioCodecSupported(t.codec));
+        if (multiAudio && supported.length && typeof MediaSource !== 'undefined') {
+          const defTrack = pickAudioTrack(supported);
           try {
             mseLoading = true;
             engine = new MseEngine(videoEl, {
               onFail: () => onEngineFail(gen)
             });
-            await engine.load(url, info, defTrack ? defTrack.id : info.audioTracks[0].id);
+            await engine.load(url, info, defTrack ? defTrack.id : supported[0].id);
             if (gen !== loadGen) return;
             mediaMode = 'mse';
-            buildAudioMenuMp4(info, defTrack);
+            buildAudioMenuMp4(info, defTrack || supported[0]);
             buildSubtitleMenu(entry, info);
             await applyPendingSeek(); // MSE：装载完成后由这里做断点定位
             mseLoading = false;
@@ -338,6 +381,15 @@
       }
       // 分析失败（非 mp4 封装 / moov 损坏）：直接原生
       await loadNative(entry, url, gen, null);
+      return;
+    }
+
+    if (MKV_FAMILY.includes(ext)) {
+      setStatus('正在分析轨道…');
+      const info = await analyzeEntryMkv(entry);
+      if (gen !== loadGen) return;
+      setStatus('');
+      await loadNativeMkv(entry, url, gen, info);
       return;
     }
 
@@ -367,13 +419,36 @@
     buildSubtitleMenu(entry, info);
   }
 
-  /** MSE 装载成功后构建音轨菜单（默认选中已装载的轨） */
+  /**
+   * Matroska / WebM：原生 <video> 播放 + 轨道菜单。
+   * Chromium 原生 Matroska 解码器不支持运行期切轨，音轨菜单只作
+   * 展示（选择时提示）；内嵌字幕（SRT/ASS）可提取为 WebVTT。
+   */
+  async function loadNativeMkv(entry, url, gen, info) {
+    if (gen !== loadGen) return;
+    mediaMode = 'native';
+    mediaInfo = info || null;
+    if (info && info.video) fpsKnown = info.video.fps || 0;
+    videoEl.src = url;
+    videoEl.load();
+    if (info && info.audioTracks.length) {
+      audioOptions = info.audioTracks.map((t) => ({
+        key: `mkv:${t.id}`,
+        label: `${langLabel(t.lang, t.name)} · ${codecPretty(t.codecId || t.codec)}`
+      }));
+      audioValue = audioOptions[0].key;
+    } else {
+      audioOptions = [{ key: 'native', label: '默认音轨' }];
+      audioValue = 'native';
+    }
+    buildSubtitleMenuMkv(entry, info);
+  }
+
+  /** MSE 装载成功后构建音轨菜单（默认选中已装载的轨；
+   *  不支持编码的轨置灰并标注原因） */
   function buildAudioMenuMp4(info, defTrack) {
-    audioOptions = info.audioTracks.map((t) => ({
-      key: `mp4:${t.id}`,
-      label: langLabel(t.lang, t.name)
-    }));
-    audioValue = `mp4:${(defTrack || info.audioTracks[0]).id}`;
+    audioOptions = info.audioTracks.map(mp4AudioOption);
+    audioValue = `mp4:${defTrack.id}`;
   }
 
   /** HLS 装载（hls.js 优先，WebView 原生支持时直读） */
@@ -450,7 +525,7 @@
     applyDefaultSubtitle();
   }
 
-  /** 构建字幕菜单（内嵌 + 外挂 + 不启用） */
+  /** 构建字幕菜单（内嵌 + 外挂 + 不启用）——mp4 家族 */
   function buildSubtitleMenu(entry, info) {
     const opts = [{ key: 'off', label: '不启用', lang: '' }];
     if (info && info.subtitleTracks.length) {
@@ -463,29 +538,54 @@
     applyDefaultSubtitle();
   }
 
-  /** 外挂字幕（同名 .vtt / .srt，含 .zh 等语言后缀）追加进菜单 */
+  /** 构建字幕菜单——Matroska 家族（SRT/ASS 可提取；图形字幕置灰） */
+  function buildSubtitleMenuMkv(entry, info) {
+    const opts = [{ key: 'off', label: '不启用', lang: '' }];
+    if (info) {
+      for (const t of info.subtitleTracks) {
+        const graphics = ['pgs', 'vobsub', 'kate', 'unknown'].includes(t.codec);
+        const kindLabel = t.codec === 'ass' ? ' ass' : t.codec === 'utf8' ? ' srt' : '';
+        opts.push({
+          key: `mkvsub:${t.id}`,
+          label: `${langLabel(t.lang, t.name)} · 内嵌${kindLabel}`,
+          lang: t.lang,
+          disabled: graphics,
+          hint: graphics ? '图形字幕（PGS / VOBSub）无法转为文本字幕' : ''
+        });
+      }
+    }
+    appendExternalSubOptions(entry, opts);
+    subOptions = opts;
+    applyDefaultSubtitle();
+  }
+
+  /** 外挂字幕（同名 .vtt / .srt / .ass / .ssa，含 .zh 等语言后缀）追加进菜单 */
   function appendExternalSubOptions(entry, opts) {
     const subs = subsByDir.get(entry.dirPath) || [];
     for (const s of matchSubs(entry.name, subs)) {
-      const isSrt = s.ext === 'srt';
+      const kind = s.ext === 'srt' ? ' srt' : (s.ext === 'ass' || s.ext === 'ssa') ? ` ${s.ext}` : '';
       opts.push({
         key: `ext:${s.path}`,
-        label: `${langLabel(s.lang)} · 外挂${isSrt ? ' srt' : ''}`,
+        label: `${langLabel(s.lang)} · 外挂${kind}`,
         lang: s.lang
       });
     }
   }
 
   /** 默认字幕：保存过的语言偏好 → 界面语言（中文） → 不启用。
-   *  内嵌字幕默认只在 MSE 模式自动选中（文件字节已在内存，零成本）；
-   *  原生模式下内嵌提取需整文件读入，默认不自动选（手动选择不受限） */
+   *  自动选中只限「零额外成本」的源：外挂文件、hls 字幕轨、MSE 模式
+   *  的 mp4 内嵌（文件字节已在内存）；mkv 内嵌与原生模式的 mp4 内嵌
+   *  需要整文件读入提取，只允许手动选择 */
   function applyDefaultSubtitle() {
-    const candidates = subOptions.filter((o) => o.key !== 'off');
+    const candidates = subOptions.filter((o) => o.key !== 'off' && !o.disabled);
     if (!candidates.length) {
       subValue = 'off';
       return;
     }
-    const usable = (o) => !o.key.startsWith('mp4:') || mediaMode === 'mse';
+    const usable = (o) =>
+      o.key.startsWith('ext:') ||
+      o.key.startsWith('hls:') ||
+      (o.key.startsWith('mp4:') && mediaMode === 'mse');
     const pick = (lang) => {
       const list = candidates.filter(usable);
       return (
@@ -534,23 +634,31 @@
 
   async function selectAudio(key) {
     if (key === audioValue) return;
-    const label = (audioOptions.find((o) => o.key === key) || {}).label || '';
+    const opt = audioOptions.find((o) => o.key === key) || {};
+    if (opt.disabled) return; // 不支持编码：置灰项（菜单层已拦截，双保险）
+    const label = opt.label || '';
     if (key.startsWith('mp4:')) {
       const id = Number(key.slice(4));
       if (mediaMode === 'mse' && engine && engine.ready) {
         try {
-          await engine.switchAudio(id);
+          // 把目标轨编码传给引擎：与当前音频 SourceBuffer 编码不同时
+          // 自动重建（v1.0.2 之前直接往旧 SB 塞新编码，切换后无声）
+          await engine.switchAudio(id, opt.codec);
           audioValue = key;
           setStatus(`音轨：${label}`);
           rememberAudioLang(id);
-        } catch {
-          setStatus('切换音轨失败');
+        } catch (e) {
+          setStatus(e && e.message ? `切换音轨失败：${e.message}` : '切换音轨失败');
         }
       } else {
         // 原生播放（MSE 不可用）：Chromium 系 <video> 无法切换音轨
         audioValue = key;
         setStatus(`音轨：${label}（原生播放暂无法切换）`);
       }
+    } else if (key.startsWith('mkv:')) {
+      // Matroska：Chromium 原生 Matroska 解码器不支持运行期切轨
+      audioValue = key;
+      setStatus(`音轨：${label}（MKV 原生播放暂无法切换）`);
     } else if (key.startsWith('hls:')) {
       const id = Number(key.slice(4));
       if (hls) {
@@ -577,8 +685,10 @@
 
   async function selectSubtitle(key, { silent = false } = {}) {
     if (key === subValue && !silent) return;
+    const opt = subOptions.find((o) => o.key === key) || {};
+    if (opt.disabled) return; // 图形字幕等：置灰项（菜单层已拦截，双保险）
     subValue = key;
-    const label = (subOptions.find((o) => o.key === key) || {}).label || '';
+    const label = opt.label || '';
     if (key === 'off') {
       if (mediaMode === 'hls' && hls) {
         try { hls.subtitleTrack = -1; } catch { /* 忽略 */ }
@@ -607,13 +717,52 @@
         if (ext === 'srt') {
           const vttText = await loadSrtAsVtt(convertFileSrc(path));
           await subManager.attach({ vttText, lang: subLangOfKey(key), label });
+        } else if (ext === 'ass' || ext === 'ssa') {
+          // 外挂 ASS/SSA：ass-compiler 解析 → 富文本 cue → WebVTT
+          const resp = await fetch(convertFileSrc(path));
+          if (!resp.ok) throw new Error(`读取字幕失败：${resp.status}`);
+          const cues = assToCues(await resp.text());
+          if (!cues.length) throw new Error('ASS 解析失败（无有效对白）');
+          const vttText = cuesToVtt(cues);
+          await subManager.attach({ vttText, lang: subLangOfKey(key), label });
         } else {
           await subManager.attach({ src: convertFileSrc(path), lang: subLangOfKey(key), label });
         }
         rememberSubLangFromLabel(key);
         if (!silent) setStatus(`字幕：${label}`);
-      } catch {
-        setStatus('字幕加载失败');
+      } catch (e) {
+        setStatus(e && e.message ? `字幕加载失败：${e.message}` : '字幕加载失败');
+        subValue = 'off';
+      }
+      return;
+    }
+    if (key.startsWith('mkvsub:')) {
+      // MKV 内嵌字幕：整文件读入 → matroska-subtitles 提取目标轨
+      const num = Number(key.slice(7));
+      const tr = mediaInfo ? mediaInfo.subtitleTracks.find((t) => t.id === num) : null;
+      if (!tr || !currentVideoPath) {
+        subValue = 'off';
+        return;
+      }
+      const size = Number(await invoke('stat_file', { path: currentVideoPath })) || 0;
+      if (size > MAX_EXTRACT_BYTES) {
+        setStatus('文件过大，暂不支持提取内嵌字幕');
+        subValue = 'off';
+        return;
+      }
+      setStatus('正在提取内嵌字幕…');
+      try {
+        const resp = await fetch(convertFileSrc(currentVideoPath));
+        if (!resp.ok) throw new Error(`读取文件失败：${resp.status}`);
+        const buf = await resp.arrayBuffer();
+        const cues = await extractMkvSubtitles(buf, num, tr);
+        const vttText = cuesToVtt(cues);
+        await subManager.attach({ vttText, lang: normLang(tr.lang), label });
+        subLangPref = normLang(tr.lang) || subLangPref;
+        scheduleSave();
+        setStatus(`字幕：${label}`);
+      } catch (e) {
+        setStatus(e && e.message ? `内嵌字幕提取失败：${e.message}` : '内嵌字幕提取失败');
         subValue = 'off';
       }
       return;
@@ -622,6 +771,12 @@
       const id = Number(key.slice(4));
       const tr = mediaInfo ? mediaInfo.subtitleTracks.find((t) => t.id === id) : null;
       if (!tr || !currentVideoPath) {
+        subValue = 'off';
+        return;
+      }
+      const size = Number(await invoke('stat_file', { path: currentVideoPath })) || 0;
+      if (size > MAX_EXTRACT_BYTES) {
+        setStatus('文件过大，暂不支持提取内嵌字幕');
         subValue = 'off';
         return;
       }
@@ -643,8 +798,8 @@
         subLangPref = normLang(tr.lang) || subLangPref;
         scheduleSave();
         setStatus(`字幕：${label}`);
-      } catch {
-        setStatus('内嵌字幕提取失败');
+      } catch (e) {
+        setStatus(e && e.message ? `内嵌字幕提取失败：${e.message}` : '内嵌字幕提取失败');
         subValue = 'off';
       }
       return;

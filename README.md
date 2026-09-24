@@ -2,6 +2,8 @@
 
 > 基于 **Rust + Tauri 2.0 + Svelte 5 + Vite** 的桌面视频播放器
 > 拖入目录即看 · 黑色影院舞台 · 字母顺序递归连看 · 多音轨 / 内嵌 + 外挂字幕 · 画面旋转缩放 · 全键盘操作 · 每文件断点续看
+>
+> v1.0.3：音轨切换修复（异编码整 MediaSource 重建）· MKV/WebM 轨道分析与内嵌 SRT/ASS 字幕提取 · 外挂 .ass/.ssa · 不支持编码菜单置灰
 
 ---
 
@@ -14,10 +16,10 @@
 | 层 | 技术 |
 |---|---|
 | 后端 | Rust 1.77+，Tauri 2（`tauri-plugin-dialog` 系统目录选择；`read_range` 按区间吐字节供前端做 moov 分析） |
-| 前端 | Svelte 5（runes），Vite 6，原生 `<video>`（asset 协议直读本地文件），mp4box.js（轨道分析 + MSE 多音轨分段），hls.js（m3u8，按需动态加载），WebVTT（字幕统一出口） |
+| 前端 | Svelte 5（runes），Vite 6，原生 `<video>`（asset 协议直读本地文件），mp4box.js（轨道分析 + MSE 多音轨分段），hls.js（m3u8，按需动态加载），matroska-subtitles（MKV 字幕提取，浏览器 bundle 按需加载），ass-compiler（ASS/SSA 解析），WebVTT（字幕统一出口） |
 | 通信 | Tauri IPC 命令 + asset 协议（本地媒体零拷贝直读） |
 
-本仓库已在 **Debian 13 + Node 24** 环境验证：`npm run build`（前端，142 模块零警告）；另以 **mock Tauri API 的无头浏览器冒烟测试**（Chromium）加载真实构建产物，用 ffmpeg 生成的**真实多音轨 MP4（中/英/日 + 内嵌 mov_text 字幕）、WebM、本地 HLS 流与外挂 vtt/srt** 完整走会话恢复、HLS 播放、快进快退与自动连播、MSE 多音轨装载与切换、内嵌字幕提取、外挂字幕挂载、旋转缩放、放大拖拽、逐帧步进、各浮层开关、音量键盘 / 滚轮、状态存档字段、断点精确恢复（RAP + 缓冲就绪精调）与 `X` 键清记忆，**40/40 断言通过，全程零运行时错误**。Rust 侧（scanner / state / commands）与极速听书对应模块同构，沙箱未装 Rust 工具链未做编译验证，请在目标平台执行 `cargo test` 与 `npm run tauri dev` 复验。
+本仓库已在 **Debian 13 + Node 24** 环境验证：`npm run build`（前端，149 模块零警告）；另以 **mock Tauri API 的无头浏览器冒烟测试**（Chromium）加载真实构建产物，用 ffmpeg 生成的**真实多音轨 MP4（中/英/日 + 内嵌 mov_text 字幕）、双编码 MP4（AAC/Opus/AC-3）、多轨 MKV（AAC/MP3 + 内嵌 ASS/SRT 字幕）、WebM、本地 HLS 流与外挂 vtt/srt/ass** 完整走会话恢复、HLS 播放、快进快退与自动连播、MKV 轨道分析与内嵌字幕提取（含 ASS 富文本）、MSE 多音轨装载与切换（同编码无感 + 异编码重建）、不支持编码菜单置灰、内嵌 / 外挂字幕挂载、旋转缩放、放大拖拽、逐帧步进、各浮层开关、音量键盘 / 滚轮、状态存档字段、断点精确恢复（RAP + 缓冲就绪精调）与 `X` 键清记忆，**79/79 断言通过（两遍回归），全程零运行时错误**。Rust 纯逻辑模块（scanner / state）在沙箱以真实 cargo 编译并跑过全部单元测试；commands / lib 的 tauri API 已逐一比对官方源码签名（沙箱无 webkit/gtk 系统库，完整 cargo check 请在目标平台执行）。
 
 ---
 
@@ -27,8 +29,8 @@
 - **点选即开**：引导页大号「+」按钮弹出系统目录选择对话框，与拖拽完全等效（无需鼠标拖拽也能用）
 - **一键关目录**：`X` 键关闭当前目录回到引导页，同时清除该目录的位置记忆（下次启动不再自动恢复）
 - **递归有序连看**：按字母顺序递归遍历所有子目录（自然排序：`ep2.mp4` 排在 `ep10.mp4` 之前），列表顺序连播，播完最后一个文件即停
-- **多音轨**（mp4box.js + MSE）：MP4 里的全部音轨（语言标签 + 声道数）进弹出式菜单；**默认选中界面语言**（中文），切换时视频画面不中断；单音轨文件自动禁用菜单；MSE 不可用（编码不支持等）时回退原生播放并在菜单里说明
-- **字幕**（统一 WebVTT）：弹出式菜单含「不启用」（默认：匹配界面语言的轨，没有匹配则不启用）；支持 MP4 内嵌字幕（wvtt / tx3g 抽样提取转 VTT）、外挂同名 `.vtt` 直挂、外挂 `.srt` 自动转 VTT（`电影.zh.srt` 之类的语言后缀会进菜单标签）；没有字幕流时按钮禁用；HLS 字幕轨由 hls.js 自带渲染
+- **多音轨**（mp4box.js + MSE）：MP4 里的全部音轨（语言标签 + 声道数）进弹出式菜单；**默认选中界面语言**（中文），且只在 MSE 支持的编码里挑；**同编码切换无感**（视频画面不中断）；**异编码切换**（AAC ⇄ Opus 等）自动重建 MediaSource 后原位恢复；WebView 不支持的编码（如 AC-3）在菜单里**置灰并标注原因**；单音轨文件自动禁用菜单；MSE 完全不可用时回退原生播放并在菜单里说明。MKV / WebM 的音轨同样列出（含编码标签），但原生播放无法切换（Chromium 限制，选择时提示）
+- **字幕**（统一 WebVTT）：弹出式菜单含「不启用」（默认：匹配界面语言的轨，没有匹配则不启用）；支持 MP4 内嵌字幕（wvtt / tx3g 抽样提取转 VTT）、**MKV 内嵌字幕（SRT / ASS，matroska-subtitles 提取，ASS 经 ass-compiler 解析为斜体 / 粗体富文本）**、外挂同名 `.vtt` 直挂、外挂 `.srt` 自动转 VTT、**外挂 `.ass` / `.ssa` 富文本解析**（`电影.zh.srt` 之类的语言后缀会进菜单标签）；图形字幕（PGS / VOBSub）在菜单中置灰说明；没有字幕流时按钮禁用；HLS 字幕轨由 hls.js 自带渲染
 - **HLS**：本地 `.m3u8` + 分片目录直接可看（hls.js；asset 协议路径整体编码导致的相对分片失效已在前端重写解决）
 - **画面旋转**（`R` / 控制栏按钮）：每次顺时针 90°，任意角度下拖拽方向都跟手
 - **画面缩放**（`+` `-` / 滚轮无关，滚轮是音量）：1×~5× 步进 0.25，放大后**拖拽平移**（屏幕位移经逆旋变换换算，画面边缘不脱离舞台），右下角 HUD 显示当前倍率与角度
@@ -46,12 +48,13 @@
 
 | 类别 | 扩展名 | 播放 | 音轨 / 字幕分析 |
 |---|---|---|---|
-| **MP4 家族** | `mp4` `m4v` `mov` | WebView 原生 | mp4box.js（多音轨 / 内嵌字幕 / 帧率） |
-| **开放格式** | `webm` `ogv` `ogg` | WebView 原生 | —（单音轨直读） |
-| **尽力播放** | `mkv` `avi` `3gp` | 取决于系统 WebView 解码器 | — |
+| **MP4 家族** | `mp4` `m4v` `mov` | 多音轨走 MSE（mp4box.js） | mp4box.js（多音轨 / 内嵌字幕 / 帧率） |
+| **Matroska 家族** | `mkv` `webm` | WebView 原生 | 手写 EBML 分析器（音轨 / 字幕轨 / 帧率）+ matroska-subtitles 字幕提取 |
+| **开放格式** | `ogv` `ogg` | WebView 原生 | —（单音轨直读） |
+| **尽力播放** | `avi` `3gp` | 取决于系统 WebView 解码器 | — |
 | **HLS** | `m3u8` | hls.js（分片走 asset 协议） | hls.js 音轨 / 字幕轨 |
 
-> 说明：播放走 WebView 的 `<video>` 元素（Windows WebView2 / macOS WKWebView / Linux WebKitGTK 对上表主流格式均有良好支持）；多音轨 / 内嵌字幕信息由前端 mp4box.js 只读 moov 元数据区获得（moov 在文件头顺序读到、在文件尾特征扫描定位，媒体数据永不过 IPC）。扩展名判断忽略大小写（`.MP4` 与 `.mp4` 等价）。
+> 说明：播放走 WebView 的 `<video>` 元素（Windows WebView2 / macOS WKWebView / Linux WebKitGTK 对上表主流格式均有良好支持）；多音轨 / 内嵌字幕信息由前端按需分析获得——MP4 只读 moov 元数据区（moov 在文件头顺序读到、在文件尾特征扫描定位），MKV / WebM 只读第一个 Cluster 之前的头部轨道表（512KB 起步扩窗至 16MB），媒体数据永不过 IPC。扩展名判断忽略大小写（`.MP4` 与 `.mp4` 等价）。
 
 ---
 
@@ -105,8 +108,8 @@
 - **快进 / 快退**：左右方向键 ±30 秒（控制栏也有 −30s / +30s 按钮）；Home / End 跳本文件开头 / 结尾；`,` `.`（含中文标点）逐帧步进
 - **音量与静音**：上下方向键 / 滚轮，每次 ±5%；控制栏滑杆可连续调节；点击音量图标静音（临时状态，不持久化），再次点击或主动调音量自动解除；音量随状态文件持久化
 - **上一 / 下一文件**：`PageUp` / `PageDown`（始终环形：最后一个的下一个回到第一个）与控制栏 ⏮ ⏭ 按钮；一个文件自动播完后顺序连播，列表末尾停止并提示「列表播放完毕」
-- **音轨选择**：弹出式菜单（控制栏「音轨」按钮），默认选中界面语言（中文）；多音轨 MP4 走 mp4box.js + MSE 双 SourceBuffer，切换时**视频画面不中断**；单音轨时按钮禁用；原生回退模式下菜单保留但切换受限（Chromium 系 `<video>` 无音轨 API）
-- **字幕选择**：弹出式菜单含「不启用」；内嵌 / 外挂 / HLS 三类来源统一列出；默认匹配界面语言（中文），无匹配则不启用；无字幕流时按钮禁用
+- **音轨选择**：弹出式菜单（控制栏「音轨」按钮），默认选中界面语言（中文，且只在 MSE 支持的编码里挑）；多音轨 MP4 走 mp4box.js + MSE 双 SourceBuffer：同编码切换**视频画面不中断**，异编码切换（AAC ⇄ Opus 等）自动重建 MediaSource 原位恢复；WebView 不支持的编码（如 AC-3）置灰并标注；单音轨时按钮禁用；原生回退模式 / MKV 下菜单保留但切换受限（Chromium 系 `<video>` 无音轨 API，选择时提示）
+- **字幕选择**：弹出式菜单含「不启用」；内嵌（MP4 wvtt/tx3g、MKV SRT/ASS）/ 外挂（.vtt/.srt/.ass/.ssa）/ HLS 三类来源统一列出；默认匹配界面语言（中文），无匹配则不启用；图形字幕（PGS/VOBSub）置灰说明；无字幕流时按钮禁用
 - **旋转与缩放**：`R` 顺时针 90° 步进；`+` `-` 缩放（1×~5×）；放大后拖拽平移，缩放回 1× 时平移自动归零；两者随状态持久化
 - **全屏（纯画面模式）**：双击画面 / 控制栏全屏按钮（原生窗口全屏）；`Esc` 全屏时退出全屏、非全屏时退出程序。**进入全屏后顶部信息栏、底部控制栏与右侧文件列表浮层立即全部隐藏**（无论播放还是暂停），屏幕上只留视频画面，鼠标活动也不会浮现；退出全屏后三个浮层恢复为 `I` / `C` / `T` 键的偏好状态（三键在全屏中仍可切换偏好，退出后生效）
 - **防屏保 / 休眠**：播放期间自动阻止系统屏保与休眠（Windows / macOS / Linux 全平台），暂停 / 播完 / 关闭目录即解除；优先用 WebView 原生 Wake Lock API，不可用时由 Rust 后备（SetThreadExecutionState / caffeinate / systemd-inhibit）兜底，进程退出后自动解除、无残留
@@ -126,7 +129,7 @@
 └── 空目录/             ← 没有视频文件的目录不会出现在分组与导航序列里
 ```
 
-准确规则：**每个目录内，先显示本目录视频文件（自然排序），再依次进入按名称排序的各子目录递归**；文件与目录均忽略大小写、数字按数值比较（`ep2 < ep10`）。目录符号链接不跟随（防目录环）。扫描同时收集各目录的外挂字幕（`.vtt` / `.srt`），按「同名前缀 + 语言后缀」挂到对应视频上。
+准确规则：**每个目录内，先显示本目录视频文件（自然排序），再依次进入按名称排序的各子目录递归**；文件与目录均忽略大小写、数字按数值比较（`ep2 < ep10`）。目录符号链接不跟随（防目录环）。扫描同时收集各目录的外挂字幕（`.vtt` / `.srt` / `.ass` / `.ssa`），按「同名前缀 + 语言后缀」挂到对应视频上。
 
 ---
 
@@ -212,8 +215,8 @@ jisu-kanpian/
 ├── prompt.txt                  # 需求原文 + 实现说明（与上游项目同款惯例）
 ├── scripts/
 │   ├── make_icons.py           # 图标源图生成（tauri icon 再生成全套）
-│   ├── make_testmedia.sh       # ffmpeg 生成冒烟测试媒体（多音轨/字幕/HLS）
-│   └── smoke/                  # 无头冒烟测试（mock Tauri + 40 项断言）
+│   ├── make_testmedia.sh       # ffmpeg 生成冒烟测试媒体（多音轨/双编码/MKV+ASS/HLS）
+│   └── smoke/                  # 无头冒烟测试（mock Tauri + 79 项断言，含 Range/206）
 │       ├── server.mjs          #   mock 服务器（dist + /files + /__invoke）
 │       ├── tauri-mock.js       #   页面侧 __TAURI_INTERNALS__ mock
 │       └── drive.sh            #   agent-browser 驱动的回归脚本
@@ -226,12 +229,18 @@ jisu-kanpian/
 │   ├── App.svelte              # 主组件：播放引擎/导航/分页/断点记忆/事件/媒体管线
 │   ├── lib/
 │   │   ├── format.js           # 展示格式化工具（时间/百分比/缩放标签）
-│   │   ├── media.js            # 扩展名/语言标签/字幕同名匹配/HLS 清单重写
+│   │   ├── media.js            # 扩展名/语言标签/编码名/字幕同名匹配/HLS 清单重写
 │   │   ├── subtitles.js        # WebVTT 统一出口（外挂 vtt/srt + 内嵌提取）
 │   │   ├── wakelock.js         # 播放期间防屏保/休眠（Wake Lock + Rust 后备）
-│   │   └── mp4/
-│   │       ├── analyzer.js     # moov 定位（头序读/尾扫描）+ 轨道信息
-│   │       └── mse-engine.js   # MSE 多音轨引擎（分段/节流/seek/切轨）
+│   │   ├── mp4/
+│   │   │   ├── analyzer.js     # moov 定位（头序读/尾扫描）+ 轨道信息
+│   │   │   └── mse-engine.js   # MSE 多音轨引擎（分段/节流/seek/切轨/EOS 收尾）
+│   │   └── mkv/
+│   │       ├── loader.js       # matroska-subtitles 浏览器 bundle 按需加载
+│   │       ├── tracks.js       # 手写 EBML 分析器（只读头部轨道表）
+│   │       ├── subtitles.js    # MKV 内嵌字幕提取（SRT/ASS → cue）
+│   │       ├── ass.js          # ASS/SSA → WebVTT 富文本（ass-compiler）
+│   │       └── vendor/         # matroska-subtitles.min.js（含 LICENSE）
 │   └── components/
 │       ├── HintScreen.svelte   # 引导屏（胶片视觉 + 大号 + 按钮）
 │       ├── InfoBar.svelte      # 顶部信息栏（I 键切换）
@@ -259,12 +268,12 @@ jisu-kanpian/
 ## 性能与设计要点（为什么流畅）
 
 1. **播放零转码**：`<video>` 元素通过 asset 协议直接读取本地文件，seek / 音量 / 暂停全部由 WebView 原生媒体管线完成，不经过 IPC 传输媒体数据
-2. **moov 分析零浪费**：轨道信息（音轨 / 字幕流 / 帧率）只需要 moov 元数据区（通常几十 KB~几 MB）——Rust `read_range` 按区间吐字节：moov 在文件头（faststart）顺序读到，在文件尾做 `moov` 特征扫描定位，几 GB 的 mdat 媒体数据一个字节都不走 IPC
-3. **MSE 多音轨按需启用**：只有「多音轨且 MSE 支持该编码组合」的 MP4 才走 mp4box.js + MSE 双 SourceBuffer 路径（整文件读入内存，分段节流生成：前瞻超 24s 暂停、剩 12s 恢复，已送样例即时释放，内存稳定在 ~1× 文件大小）；其余文件全部原生直读，零额外开销
-4. **切换音轨画面不中断**：切轨只清音频 SourceBuffer 并单独 `seekTrack` 重定位新轨，视频缓冲原封不动；视频轨的 nextSample 指针继续推进
+2. **moov / 轨道表分析零浪费**：MP4 的轨道信息只需要 moov 元数据区（通常几十 KB~几 MB），MKV 的轨道表在第一个 Cluster 之前的头部——两者都由 Rust `read_range` 按区间吐字节（moov 在文件头顺序读到、在文件尾特征扫描定位；MKV 从 512KB 起步扩窗至 16MB），几 GB 的 mdat 媒体数据一个字节都不走 IPC
+3. **MSE 多音轨按需启用**：只有「多音轨且 MSE 支持至少一条音轨编码」的 MP4 才走 mp4box.js + MSE 双 SourceBuffer 路径（整文件读入内存，分段节流生成：前瞻超 24s 暂停、剩 12s 恢复，已送样例即时释放，内存稳定在 ~1× 文件大小）；两轨送完后 endOfStream 收尾（否则播到样本尽头不触发 ended，连播失效）；其余文件全部原生直读，零额外开销
+4. **同编码切轨画面不中断**：只清音频 SourceBuffer 并单独 `seekTrack` 重定位新轨，视频缓冲原封不动；异编码切轨（AAC ⇄ Opus 等）因 MSE 的 codecs 锁定与 Chromium 的 SourceBuffer 数量上限，采用**整个 MediaSource 重建**（mp4box 实例与整文件缓冲全程复用，零二次读盘），画面短暂重载后原位恢复
 5. **两段式精确 seek**：MSE 路径粗定位到目标前最近的关键帧（RAP），待该处媒体段进缓冲后自动精调到目标帧——断点恢复能落回退出帧，逐帧步进在已缓冲区直接精确落点
 6. **HLS 相对路径重写**：asset 协议把整个文件路径整体编码（`%2F` 不是路径分隔符），浏览器按 URL 规则解析相对分片会丢目录——前端拿到 m3u8 后按**文件系统路径**把每个分片与 `URI="…"` 属性重写为绝对 asset URL
-7. **字幕统一 WebVTT 出口**：内嵌 wvtt / tx3g 由 mp4box 抽样（`setExtractionOptions` + `onSamples`）解出文本生成 VTT blob；外挂 srt 时间戳逗号→点转换；全部挂 `<track>`，浏览器原生渲染
+7. **字幕统一 WebVTT 出口**：MP4 内嵌 wvtt / tx3g 由 mp4box 抽样解出文本；MKV 内嵌 SRT / ASS 由 matroska-subtitles 流式提取（浏览器 bundle 按需加载 147KB，其它格式零开销）；ASS / SSA（含外挂）由 ass-compiler 解析为斜体 / 粗体富文本，丢弃绘图指令与排版特效；外挂 srt 时间戳逗号→点转换；全部挂 `<track>`，浏览器原生渲染
 8. **hls.js 按需加载**：只有播放 m3u8 时才动态 import（独立 chunk ~590KB），普通播放零负担
 9. **高频状态隔离**：`flat[]` 等大数据不进 Svelte 响应式；拖拽平移的 pan 更新走「值不变不写」+ untrack，避免 effect 自触发循环；进度文字用 timeupdate 节流
 10. **扫描在阻塞线程池**：`spawn_blocking` 执行递归扫描，UI 永不卡顿

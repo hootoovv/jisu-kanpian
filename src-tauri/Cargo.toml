@@ -1,6 +1,6 @@
 [package]
 name = "jisu-kanpian"
-version = "1.0.2"
+version = "1.0.3"
 description = "极速看片 - 极速视频播放器（Tauri 2 + Svelte，多音轨 / 字幕 / HLS）"
 authors = ["jisu-kanpian"]
 edition = "2021"

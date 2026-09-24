@@ -5,6 +5,9 @@
 /** 需要 mp4box.js 分析（多音轨 / 字幕流探测）的扩展名 */
 export const MP4_FAMILY = ['mp4', 'm4v', 'mov'];
 
+/** Matroska 家族（mkv/webm 同源）：走手写 EBML 轨道分析器 */
+export const MKV_FAMILY = ['mkv', 'webm'];
+
 /** HLS 播放列表 */
 export const HLS_FAMILY = ['m3u8'];
 
@@ -60,7 +63,7 @@ export function isChineseLang(code) {
 }
 
 /**
- * 为一个视频文件匹配同目录的外挂字幕（.vtt / .srt）。
+ * 为一个视频文件匹配同目录的外挂字幕（.vtt / .srt / .ass / .ssa）。
  * 匹配规则（宽松同名）：
  *   movie.mp4 → movie.vtt / movie.srt / movie.zh.vtt / movie.chs.srt …
  *   多语言后缀（zh/chs/cht/chi/en/eng/jpn…）用来标注字幕语言。
@@ -100,6 +103,32 @@ function normLangTag(tag) {
 
 /** 语言代码规范化（轨道 mdhd 语言 / 文件名标记通用） */
 export const normLang = normLangTag;
+
+/** 编码标识 → 友好名（音轨菜单「不支持」标注 / MKV 轨道标签用）。
+ *  同时兼容 MP4 的 mp4box codec（mp4a.40.2 等）与 MKV 的 CodecID
+ *  （A_AAC / A_MPEG/L3 / A_AC3 …，剥掉 A_ 前缀后匹配） */
+export function codecPretty(codec) {
+  const c = String(codec || '').toLowerCase().trim().replace(/^a_/, '');
+  if (!c) return '未知';
+  if (c.startsWith('mp4a.40.2')) return 'AAC';
+  if (c.startsWith('mp4a.40.5')) return 'HE-AAC';
+  if (c.startsWith('mp4a.69') || c.startsWith('mp4a.6b') || c === 'mp3' || c === 'mpeg/l3' || c === 'mpeg/l1' || c === 'mpeg/l2') return 'MP3';
+  if (c.startsWith('aac')) return 'AAC';
+  if (c === 'opus') return 'Opus';
+  if (c === 'vorbis') return 'Vorbis';
+  if (c === 'ac-3' || c === 'ac3') return 'AC-3';
+  if (c === 'ec-3' || c === 'eac3') return 'E-AC-3';
+  if (c === 'flac') return 'FLAC';
+  if (c === 'alac') return 'ALAC';
+  if (c === 'dts') return 'DTS';
+  if (c === 'truehd') return 'TrueHD';
+  if (c === 'pcm/int/lit') return 'PCM';
+  if (c === 'mpeg4/iso/avc') return 'H.264';
+  if (c === 'vp9') return 'VP9';
+  if (c === 'vp8') return 'VP8';
+  if (c === 'av1') return 'AV1';
+  return c;
+}
 
 /** srt 文本 → WebVTT 文本（时间戳逗号→点、加 WEBVTT 头） */
 export function srtToVtt(srt) {

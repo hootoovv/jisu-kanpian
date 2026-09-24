@@ -25,7 +25,8 @@ const PORT = Number(process.env.PORT || 4174);
 const STATE_LOG = path.resolve(__dirname, 'state-log.json');
 
 const VIDEO_EXTS = ['mp4', 'm4v', 'mov', '3gp', 'webm', 'ogv', 'ogg', 'mkv', 'avi', 'm3u8'];
-const SUB_EXTS = ['vtt', 'srt'];
+// 与 src-tauri/src/scanner.rs 的 SUB_EXTS 保持一致（v1.0.3 起含 ass/ssa）
+const SUB_EXTS = ['vtt', 'srt', 'ass', 'ssa'];
 
 /* ---------- 与 scanner.rs 一致的自然排序 ---------- */
 function naturalCmp(a, b) {
@@ -202,12 +203,15 @@ const MIME = {
   '.json': 'application/json',
   '.mp4': 'video/mp4',
   '.m4v': 'video/mp4',
+  '.mkv': 'video/x-matroska',
   '.webm': 'video/webm',
   '.ogv': 'video/ogg',
   '.ts': 'video/mp2t',
   '.m3u8': 'application/vnd.apple.mpegurl',
   '.vtt': 'text/vtt; charset=utf-8',
-  '.srt': 'text/plain; charset=utf-8'
+  '.srt': 'text/plain; charset=utf-8',
+  '.ass': 'text/plain; charset=utf-8',
+  '.ssa': 'text/plain; charset=utf-8'
 };
 
 const server = http.createServer((req, res) => {
@@ -264,13 +268,55 @@ const server = http.createServer((req, res) => {
     return;
   }
   const ext = path.extname(fp).toLowerCase();
-  const stream = fs.createReadStream(fp);
-  // 冒烟测试服务器：一律禁用缓存，保证 reload 拉到最新构建
-  res.writeHead(200, {
+  // ---- 静态文件：带 Range / Content-Length 的完整 HTTP 语义 ----
+  // 为什么必须支持 Range：原生 <video>（asset 协议映射到本服务）的
+  // seek 依赖字节范围请求；没有 Range / Content-Length 时 Chromium 把
+  // 响应当 progressive 流，seek 失效（currentTime 卡住不触发 ended）。
+  // v1.0.3 起测试媒体含原生播放的 MKV，此前 MSE/HLS 全走 blob 不受影响。
+  const stat = fs.statSync(fp);
+  const total = stat.size;
+  const range = req.headers.range;
+  const baseHead = {
     'Content-Type': MIME[ext] || 'application/octet-stream',
-    'Cache-Control': 'no-store'
-  });
-  stream.pipe(res);
+    'Cache-Control': 'no-store',
+    'Accept-Ranges': 'bytes'
+  };
+  if (range) {
+    // 例：Range: bytes=100- / bytes=100-199 / bytes=-100（后缀）
+    const m = /^bytes=(\d*)-(\d*)$/.exec(String(range).trim());
+    if (!m) {
+      res.writeHead(416, { 'Content-Range': `bytes */${total}` });
+      res.end();
+      return;
+    }
+    let start = m[1] === '' ? NaN : Number(m[1]);
+    let end = m[2] === '' ? NaN : Number(m[2]);
+    if (Number.isNaN(start) && Number.isNaN(end)) {
+      // 后缀范围：bytes=-N → 最后 N 字节
+      start = Math.max(0, total - Number(String(range).trim().slice(7)));
+      end = total - 1;
+    } else if (Number.isNaN(start)) {
+      start = Math.max(0, total - (Number.isNaN(end) ? 0 : end + 1));
+      end = total - 1;
+    } else if (Number.isNaN(end)) {
+      end = total - 1;
+    }
+    if (start > end || start >= total) {
+      res.writeHead(416, { 'Content-Range': `bytes */${total}` });
+      res.end();
+      return;
+    }
+    end = Math.min(end, total - 1);
+    res.writeHead(206, {
+      ...baseHead,
+      'Content-Range': `bytes ${start}-${end}/${total}`,
+      'Content-Length': String(end - start + 1)
+    });
+    fs.createReadStream(fp, { start, end }).pipe(res);
+    return;
+  }
+  res.writeHead(200, { ...baseHead, 'Content-Length': String(total) });
+  fs.createReadStream(fp).pipe(res);
 });
 
 server.listen(PORT, () => {

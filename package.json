@@ -1,7 +1,7 @@
 {
   "name": "jisu-kanpian",
   "private": true,
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "极速看片 —— 基于 Tauri 2 + Svelte 的桌面视频播放器（多音轨 / 字幕 / HLS）",
   "type": "module",
   "scripts": {
@@ -13,6 +13,7 @@
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",
     "@tauri-apps/plugin-dialog": "^2.7.3",
+    "ass-compiler": "^0.1.16",
     "hls.js": "^1.5.13",
     "mp4box": "^2.4.1"
   },

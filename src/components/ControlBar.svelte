@@ -25,10 +25,10 @@
     muted = false,
     rotation = 0,
     fullscreen = false,
-    audioOptions = [],   // [{ key, label }]
+    audioOptions = [],   // [{ key, label, disabled? }]
     audioValue = '',     // 当前选中的 key
     audioDisabled = true,
-    subOptions = [],     // [{ key, label }]
+    subOptions = [],     // [{ key, label, disabled? }]
     subValue = 'off',
     subDisabled = true,
     ontoggle = null,
@@ -81,10 +81,14 @@
   }
   function pickAudio(key) {
     openMenu = null;
+    const opt = audioOptions.find((o) => o.key === key);
+    if (!opt || opt.disabled) return; // 不支持编码的轨：置灰不可选（见 App 层标注）
     if (key !== audioValue) onaudio?.(key);
   }
   function pickSub(key) {
     openMenu = null;
+    const opt = subOptions.find((o) => o.key === key);
+    if (!opt || opt.disabled) return; // 图形字幕等：置灰不可选
     if (key !== subValue) onsubtitle?.(key);
   }
 </script>
@@ -155,8 +159,10 @@
               <div
                 class="menu-item"
                 class:sel={opt.key === audioValue}
+                class:dim={opt.disabled}
                 role="menuitem"
                 tabindex="-1"
+                title={opt.disabled ? opt.hint || '当前 WebView 不支持该编码' : ''}
                 onclick={() => pickAudio(opt.key)}
               >
                 <span class="check">{opt.key === audioValue ? '✓' : ''}</span>
@@ -193,8 +199,10 @@
               <div
                 class="menu-item"
                 class:sel={opt.key === subValue}
+                class:dim={opt.disabled}
                 role="menuitem"
                 tabindex="-1"
+                title={opt.disabled ? opt.hint || '不支持的字幕格式' : ''}
                 onclick={() => pickSub(opt.key)}
               >
                 <span class="check">{opt.key === subValue ? '✓' : ''}</span>
@@ -468,6 +476,13 @@
   }
   .menu-item.sel {
     color: #7ee787; /* 选中项：绿色（与播放键呼应） */
+  }
+  .menu-item.dim {
+    color: rgba(255, 255, 255, 0.28); /* 不支持编码的轨 / 图形字幕：置灰不可选 */
+    cursor: default;
+  }
+  .menu-item.dim:hover {
+    background: transparent;
   }
   .check {
     flex: none;

@@ -8,8 +8,9 @@
 //!    因此 ep2.mp4 排在 ep10.mp4 之前；
 //! 4. 只收录含有视频文件的目录；没有任何视频文件的空目录不会
 //!    出现在分页列表的目录分组里。
-//! 5. 每个目录同时收集外挂字幕文件（.vtt / .srt），供前端按
-//!    「同名前缀」匹配挂到对应视频上（WebVTT 外挂字幕）。
+//! 5. 每个目录同时收集外挂字幕文件（.vtt / .srt / .ass / .ssa），供
+//!    前端按「同名前缀」匹配挂到对应视频上（统一转 WebVTT 挂载：
+//!    srt 时间戳修补 / ass 由 ass-compiler 解析出富文本）。
 //!
 //! 与听书软件不同的一点：扫描阶段不做任何容器解析——播放交给
 //! WebView 的 <video> 元素（asset 协议直读，天然支持 seek 与音量），
@@ -31,8 +32,9 @@ pub const VIDEO_EXTS: &[&str] = &[
     "mp4", "m4v", "mov", "3gp", "webm", "ogv", "ogg", "mkv", "avi", "m3u8",
 ];
 
-/// 外挂字幕扩展名（.srt 由前端转成 WebVTT 再挂载）
-pub const SUB_EXTS: &[&str] = &["vtt", "srt"];
+/// 外挂字幕扩展名（.srt 由前端转成 WebVTT 再挂载；.ass / .ssa 由
+/// ass-compiler 解析为富文本 cue 后生成 WebVTT）
+pub const SUB_EXTS: &[&str] = &["vtt", "srt", "ass", "ssa"];
 
 /// 单个视频文件
 #[derive(Serialize, Clone, Debug)]
@@ -328,6 +330,7 @@ mod tests {
         assert!(!is_video("mp4")); // 无扩展名
         assert!(is_sub("CHS.SRT"));
         assert!(is_sub("note.vtt"));
-        assert!(!is_sub("x.ass")); // v1 只支持 vtt / srt
+        assert!(is_sub("x.ass")); // ass / ssa 外挂字幕（v1.0.3 起）
+        assert!(is_sub("y.SSA"));
     }
 }
